@@ -25,6 +25,8 @@ pip-wheel-metadata/
 *.sqlite
 *.pkl
 *.h5
+outputs/
+wandb/
 
 # Test coverage reports
 htmlcov/

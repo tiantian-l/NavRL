@@ -37,8 +37,9 @@ class Agent:
 
         file_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ckpts")
         checkpoint = "navrl_checkpoint.pt"
-
-        policy.load_state_dict(torch.load(os.path.join(file_dir, checkpoint), map_location=self.device))
+        my_model='/home/tiali/project/NavRL/wandb/offline-run-20260222_185941-6dd9wz2e/files/checkpoint_4000.pt'
+        policy.load_state_dict(torch.load(my_model, map_location=self.device))
+        #policy.load_state_dict(torch.load(os.path.join(file_dir, checkpoint), map_location=self.device))
         return policy
     
     def plan(self, robot_state, static_obs_input, dyn_obs_input, target_dir):
