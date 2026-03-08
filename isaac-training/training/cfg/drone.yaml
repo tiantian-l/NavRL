@@ -1,5 +1,11 @@
 drone:  
   model_name: "hummingbird"
+  randomization:
+    eval:
+      mass_scale: [0.8, 1.2]        # mass ±20%
+      inertia_scale: [0.8, 1.2]     # inertia ±20%
+      t2w_scale: [0.9, 1.1]         # thrust coefficient ±10%
+      f2m_scale: [0.9, 1.1]         # moment coefficient ±10%
 
 sensor:
   lidar_range: 4.

@@ -40,6 +40,8 @@ class NavigationEnv(IsaacEnv):
         
         # Drone Initialization
         self.drone.initialize()
+        if hasattr(self.cfg.drone, 'randomization'):
+            self.drone.setup_randomization(self.cfg.drone.randomization)
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
 
 

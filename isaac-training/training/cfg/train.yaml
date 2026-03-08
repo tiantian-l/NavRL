@@ -15,7 +15,10 @@ save_interval: 1000
 
 # Training Environment
 env:
-  num_envs: 4 # Number of drones for training
+  num_envs: 4 # Number of drones for training，coping hummingbird 无人机，无人机参数完全一样
+              #各环境中心在 grid 上偏移了 env_spacing=8.0m，
+              #位置不同：各环境中心在 grid 上偏移了 env_spacing=8.0m
+              #起终点不同：训练时每架无人机的起点和目标独立随机采样
   max_episode_length: 2200
   env_spacing: 8.0 
   num_obstacles: 350
