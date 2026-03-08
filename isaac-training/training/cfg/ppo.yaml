@@ -13,8 +13,8 @@ algo:
     clip_ratio: 0.1
   
   entropy_loss_coefficient: 1e-4 # encourage exploration
-  training_frame_num: 512
+  training_frame_num: 256
   #num_minibatches: 8   # minibatch_size = 64
  # training_frame_num: 32
   training_epoch_num: 4
-  num_minibatches: 32 # split into N minibatches
+  num_minibatches: 16 # split into N minibatches
