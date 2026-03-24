@@ -1,5 +1,19 @@
 drone:  
   model_name: "hummingbird"
+  # --- Dynamic Uncertainty for Eval ---
+  # Set each to true/false to individually enable/disable
+  randomization:
+    eval:
+      # 1. Mass uncertainty: ±15% of nominal (0.716 kg)
+      mass_scale: [0.85, 1.15]
+      mass_enabled: true
+      # 2. Thrust coefficient (KF) via thrust-to-weight ratio: ±15%
+      t2w_scale: [0.85, 1.15]
+      t2w_enabled: true
+      # 3. External wind disturbance (m/s^2 equivalent force/mass)
+      #    Applied as constant force per episode in world frame
+      wind_speed: [0.0, 1.5]      # wind magnitude range (m/s^2)
+      wind_enabled: true
 
 sensor:
   lidar_range: 4.

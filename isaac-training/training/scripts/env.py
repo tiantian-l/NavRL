@@ -40,6 +40,28 @@ class NavigationEnv(IsaacEnv):
         
         # Drone Initialization
         self.drone.initialize()
+        # Setup domain randomization (mass, KF) if configured
+        if hasattr(self.cfg.drone, 'randomization'):
+            # Filter out non-DR keys (wind_enabled, *_enabled) before passing to drone
+            dr_cfg = {}
+            for phase in ('train', 'eval'):
+                if phase not in self.cfg.drone.randomization:
+                    continue
+                phase_cfg = dict(self.cfg.drone.randomization[phase])
+                # Remove wind and enable flags — these are handled by env, not drone
+                filtered = {}
+                for k, v in phase_cfg.items():
+                    if k.endswith('_enabled') or k.startswith('wind'):
+                        continue
+                    # Only include if the corresponding _enabled flag is true (or absent)
+                    param_name = k.replace('_scale', '')  # mass_scale -> mass, t2w_scale -> t2w
+                    enabled_key = f"{param_name}_enabled"
+                    if phase_cfg.get(enabled_key, True):
+                        filtered[k] = v
+                if filtered:
+                    dr_cfg[phase] = filtered
+            if dr_cfg:
+                self.drone.setup_randomization(dr_cfg)
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
 
 
@@ -70,6 +92,8 @@ class NavigationEnv(IsaacEnv):
             self.target_dir = torch.zeros(self.num_envs, 1, 3)
             self.height_range = torch.zeros(self.num_envs, 1, 2)
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
+            # Wind disturbance: constant force per episode (world frame, m/s^2 equiv)
+            self.wind_force = torch.zeros(self.num_envs, 1, 3)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.     
@@ -413,14 +437,44 @@ class NavigationEnv(IsaacEnv):
         self.drone.set_world_poses(pos, rot, env_ids)
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.prev_drone_vel_w[env_ids] = 0.
+        # Sample wind disturbance for new episodes (only during eval if configured)
+        self._sample_wind(env_ids)
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
         self.stats[env_ids] = 0.  
         
+    def _sample_wind(self, env_ids: torch.Tensor):
+        """Sample per-episode constant wind disturbance for given env_ids."""
+        wind_cfg = getattr(self.cfg.drone, 'randomization', None)
+        if wind_cfg is None:
+            self.wind_force[env_ids] = 0.
+            return
+        # Determine phase
+        phase = 'train' if self.training else 'eval'
+        phase_cfg = getattr(wind_cfg, phase, None)
+        if phase_cfg is None or not getattr(phase_cfg, 'wind_enabled', False):
+            self.wind_force[env_ids] = 0.
+            return
+        wind_range = phase_cfg.wind_speed  # [min, max] m/s^2
+        n = len(env_ids)
+        # Random magnitude uniform in [min, max]
+        mag = torch.empty(n, 1, 1, device=self.device).uniform_(wind_range[0], wind_range[1])
+        # Random 3D direction (uniform on sphere)
+        direction = torch.randn(n, 1, 3, device=self.device)
+        direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
+        self.wind_force[env_ids] = mag * direction
+
     def _pre_sim_step(self, tensordict: TensorDictBase):
-        actions = tensordict[("agents", "action")] 
-        self.drone.apply_action(actions) 
+        actions = tensordict[("agents", "action")]
+        self.drone.apply_action(actions)
+        # Apply wind disturbance as external force on the base link (world frame)
+        if self.wind_force.any():
+            wind_world = self.wind_force * self.drone.masses  # force = acc * mass
+            self.drone.base_link.apply_forces_and_torques_at_pos(
+                wind_world.reshape(-1, 3),
+                is_global=True
+            )
 
     def _post_sim_step(self, tensordict: TensorDictBase):
         if (self.cfg.env_dyn.num_obstacles != 0):
