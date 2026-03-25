@@ -498,7 +498,7 @@ class NavigationEnv(IsaacEnv):
         actions = tensordict[("agents", "action")]
         # Capture velocity command saved by VelController
         if ("info", "vel_cmd") in tensordict.keys(include_nested=True):
-            self.vel_cmd[:] = tensordict[("info", "vel_cmd")]
+            self.vel_cmd[:] = tensordict[("info", "vel_cmd")].reshape(self.num_envs, 1, 3)
         self.drone.apply_action(actions)
         # Apply wind disturbance as external force on the base link (world frame)
         if self.wind_force.any():
