@@ -261,6 +261,7 @@ class VelController(Transform):
 
         torch.nan_to_num_(cmds, 0.)
         tensordict.set(self.action_key, cmds)
+        tensordict.set(("info", "vel_cmd"), target_vel)
         return tensordict
 
 

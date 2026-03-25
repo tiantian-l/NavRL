@@ -94,6 +94,21 @@ class NavigationEnv(IsaacEnv):
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
             # Wind disturbance: constant force per episode (world frame, m/s^2 equiv)
             self.wind_force = torch.zeros(self.num_envs, 1, 3)
+            # --- Controller evaluation: Uc(t) sliding window ---
+            ce = getattr(self.cfg.drone, 'controller_eval', None)
+            self._uc_window = int(ce.uc_window) if ce and hasattr(ce, 'uc_window') else 62
+            self._uc_threshold = float(ce.uc_threshold) if ce and hasattr(ce, 'uc_threshold') else 30.0
+            self._v_floor = float(ce.v_floor) if ce and hasattr(ce, 'v_floor') else 0.1
+            W = self._uc_window
+            # Ring buffers for sliding window: (num_envs, W, 3)
+            self._vel_cmd_buf = torch.zeros(self.num_envs, self._uc_window, 3)
+            self._vel_real_buf = torch.zeros(self.num_envs, self._uc_window, 3)
+            self._buf_ptr = torch.zeros(self.num_envs, dtype=torch.long)  # write pointer per env
+            self._buf_filled = torch.zeros(self.num_envs, dtype=torch.long)  # how many valid entries
+            # Episode accumulators for U95 and R_exc
+            self._uc_history = [[] for _ in range(self.num_envs)]  # list of Uc values per env
+            self._exc_count = torch.zeros(self.num_envs, 1)  # count of steps where Uc > U_th
+            self.vel_cmd = torch.zeros(self.num_envs, 1, 3)  # latest velocity command
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.     
@@ -359,10 +374,15 @@ class NavigationEnv(IsaacEnv):
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
+            # Controller execution uncertainty metrics
+            "Uc_mean": UnboundedContinuousTensorSpec(1),   # episode-mean Uc(t)  (%)
+            "U95": UnboundedContinuousTensorSpec(1),        # 95th percentile of Uc(t) (%)
+            "R_exc": UnboundedContinuousTensorSpec(1),      # fraction of time Uc > U_th
         }).expand(self.num_envs).to(self.device)
 
         info_spec = CompositeSpec({
             "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
+            "vel_cmd": UnboundedContinuousTensorSpec((self.drone.n, 3), device=self.device),
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         self.observation_spec["info"] = info_spec
@@ -437,6 +457,15 @@ class NavigationEnv(IsaacEnv):
         self.drone.set_world_poses(pos, rot, env_ids)
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.prev_drone_vel_w[env_ids] = 0.
+        # Reset controller Uc sliding window buffers
+        self._vel_cmd_buf[env_ids] = 0.
+        self._vel_real_buf[env_ids] = 0.
+        self._buf_ptr[env_ids] = 0
+        self._buf_filled[env_ids] = 0
+        for eid in env_ids.tolist():
+            self._uc_history[eid] = []
+        self._exc_count[env_ids] = 0.
+        self.vel_cmd[env_ids] = 0.
         # Sample wind disturbance for new episodes (only during eval if configured)
         self._sample_wind(env_ids)
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
@@ -467,6 +496,9 @@ class NavigationEnv(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        # Capture velocity command saved by VelController
+        if ("info", "vel_cmd") in tensordict.keys(include_nested=True):
+            self.vel_cmd[:] = tensordict[("info", "vel_cmd")]
         self.drone.apply_action(actions)
         # Apply wind disturbance as external force on the base link (world frame)
         if self.wind_force.any():
@@ -649,6 +681,40 @@ class NavigationEnv(IsaacEnv):
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
+
+        # --- Controller execution uncertainty Uc(t) ---
+        v_cmd_3d = self.vel_cmd.squeeze(1)       # (num_envs, 3)
+        v_real_3d = self.drone.vel_w[..., :3].squeeze(1)  # (num_envs, 3)
+        W = self._uc_window
+        # Write into ring buffer
+        ptr = self._buf_ptr  # (num_envs,)
+        self._vel_cmd_buf[torch.arange(self.num_envs, device=self.device), ptr] = v_cmd_3d
+        self._vel_real_buf[torch.arange(self.num_envs, device=self.device), ptr] = v_real_3d
+        self._buf_ptr = (ptr + 1) % W
+        self._buf_filled = torch.clamp(self._buf_filled + 1, max=W)
+        # Compute Uc(t) from ring buffer
+        filled = self._buf_filled.float().unsqueeze(-1)  # (num_envs, 1)
+        err_sq = (self._vel_cmd_buf - self._vel_real_buf).pow(2).sum(-1)  # (num_envs, W)
+        rms_err = (err_sq.sum(-1, keepdim=True) / filled.clamp(min=1)).sqrt()  # (num_envs, 1)
+        v_bar = self._vel_cmd_buf.norm(dim=-1).sum(-1, keepdim=True) / filled.clamp(min=1)  # (num_envs, 1)
+        Uc = rms_err / torch.clamp(v_bar, min=self._v_floor) * 100.0  # percentage
+        # Accumulate for U95 and R_exc
+        for i in range(self.num_envs):
+            if self._buf_filled[i] >= W:  # only after window is full
+                self._uc_history[i].append(Uc[i, 0].item())
+        self._exc_count += (Uc > self._uc_threshold).float() * (self._buf_filled >= W).unsqueeze(-1).float()
+        # Compute episode-level stats (valid at terminal step)
+        ep_len = self.progress_buf.unsqueeze(1).clamp(min=1).float()
+        valid_steps = (ep_len - W).clamp(min=1)  # steps where Uc was computable
+        for i in range(self.num_envs):
+            if len(self._uc_history[i]) > 0:
+                uc_tensor = torch.tensor(self._uc_history[i], device=self.device)
+                self.stats["Uc_mean"][i] = uc_tensor.mean()
+                self.stats["U95"][i] = torch.quantile(uc_tensor, 0.95)
+            else:
+                self.stats["Uc_mean"][i] = 0.
+                self.stats["U95"][i] = 0.
+        self.stats["R_exc"] = self._exc_count / valid_steps
 
         return TensorDict({
             "agents": TensorDict(

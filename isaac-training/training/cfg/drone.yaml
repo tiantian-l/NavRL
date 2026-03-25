@@ -14,6 +14,14 @@ drone:
       #    Applied as constant force per episode in world frame
       wind_speed: [0.0, 1.5]      # wind magnitude range (m/s^2)
       wind_enabled: true
+  # --- Controller Evaluation Parameters ---
+  controller_eval:
+    uc_window: 62       # sliding window W in steps (≈1s at dt=0.016)
+    v_floor: 0.1        # normalization floor (m/s), prevents div-by-zero at low speed
+    # R_exc threshold: set to nominal U95 after running baseline eval
+    # Step 1: run eval with all *_enabled: false, read U95 from WandB
+    # Step 2: paste that value here, then run DR eval
+    uc_threshold: 30.0  # U_th (%), default 30; replace with nominal U95
 
 sensor:
   lidar_range: 4.
