@@ -725,7 +725,7 @@ class NavigationEnv(IsaacEnv):
                 [self.num_envs]
             ),
             "stats": self.stats.clone(),
-            "info": self.info
+            "info": self.info.clone()
         }, self.batch_size)
 
     def _compute_reward_and_done(self):
