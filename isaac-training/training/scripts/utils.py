@@ -217,33 +217,24 @@ def evaluate(
         vel_cmd_all = trajs[("next", "info", "vel_cmd")].cpu()    # (num_envs, T, 1, 3)
         drone_st_all = trajs[("next", "info", "drone_state")].cpu()  # (num_envs, T, 1, 13)
         vel_real_all = drone_st_all[..., 7:10]                      # (num_envs, T, 1, 3)
-        dt = cfg.sim.dt * cfg.sim.substeps
         num_envs = vel_cmd_all.shape[0]
 
         for ei in range(num_envs):
             ep_len = first_done[ei].item() + 1
             v_cmd = vel_cmd_all[ei, :ep_len, 0, :]   # (ep_len, 3)
             v_real = vel_real_all[ei, :ep_len, 0, :]  # (ep_len, 3)
-            t_sec = np.arange(ep_len) * dt
 
-            fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
-
-            # vx
-            axes[0].plot(t_sec, v_cmd[:, 0].numpy(), label="vx_cmd", linewidth=1.0)
-            axes[0].plot(t_sec, v_real[:, 0].numpy(), label="vx_real", linewidth=1.0, alpha=0.8)
-            axes[0].set_ylabel("vx (m/s)")
-            axes[0].legend(loc="upper right")
-            axes[0].grid(True, alpha=0.3)
-            axes[0].set_title(f"Env {ei}  |  episode length = {ep_len} steps ({ep_len*dt:.1f}s)")
-
-            # vy
-            axes[1].plot(t_sec, v_cmd[:, 1].numpy(), label="vy_cmd", linewidth=1.0)
-            axes[1].plot(t_sec, v_real[:, 1].numpy(), label="vy_real", linewidth=1.0, alpha=0.8)
-            axes[1].set_ylabel("vy (m/s)")
-            axes[1].set_xlabel("Time (s)")
-            axes[1].legend(loc="upper right")
-            axes[1].grid(True, alpha=0.3)
-
+            fig, ax = plt.subplots(figsize=(8, 8))
+            ax.plot(v_cmd[:, 0].numpy(), v_cmd[:, 1].numpy(),
+                    color="tab:blue", linewidth=1.0, alpha=0.8, label="cmd")
+            ax.plot(v_real[:, 0].numpy(), v_real[:, 1].numpy(),
+                    color="tab:orange", linewidth=1.0, alpha=0.8, label="real")
+            ax.set_xlabel("vx (m/s)")
+            ax.set_ylabel("vy (m/s)")
+            ax.set_title(f"Env {ei}  |  velocity trajectory ({ep_len} steps)")
+            ax.legend(loc="upper right")
+            ax.set_aspect("equal")
+            ax.grid(True, alpha=0.3)
             fig.tight_layout()
             info[f"eval/vel_tracking_env{ei}"] = wandb.Image(fig)
             plt.close(fig)
