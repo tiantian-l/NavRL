@@ -214,15 +214,30 @@ def evaluate(
 
     # --- Velocity tracking plots (per env, first episode) ---
     try:
+        # DEBUG: check what keys are available in trajs
+        print("[DEBUG] trajs keys:", trajs.keys(include_nested=True))
+        print("[DEBUG] trajs['next'] keys:", trajs["next"].keys(include_nested=True))
+
         vel_cmd_all = trajs[("next", "info", "vel_cmd")].cpu()    # (num_envs, T, 1, 3)
         drone_st_all = trajs[("next", "info", "drone_state")].cpu()  # (num_envs, T, 1, 13)
         vel_real_all = drone_st_all[..., 7:10]                      # (num_envs, T, 1, 3)
         num_envs = vel_cmd_all.shape[0]
 
+        print(f"[DEBUG] vel_cmd_all shape: {vel_cmd_all.shape}")
+        print(f"[DEBUG] vel_real_all shape: {vel_real_all.shape}")
+        print(f"[DEBUG] first_done: {first_done}")
+
         for ei in range(num_envs):
             ep_len = first_done[ei].item() + 1
             v_cmd = vel_cmd_all[ei, :ep_len, 0, :]   # (ep_len, 3)
             v_real = vel_real_all[ei, :ep_len, 0, :]  # (ep_len, 3)
+
+            print(f"[DEBUG] env{ei}: ep_len={ep_len}, v_cmd range=[{v_cmd.min():.4f}, {v_cmd.max():.4f}], v_real range=[{v_real.min():.4f}, {v_real.max():.4f}]")
+            print(f"[DEBUG] env{ei}: v_cmd[:5]={v_cmd[:5].tolist()}")
+            print(f"[DEBUG] env{ei}: v_real[:5]={v_real[:5].tolist()}")
+            # check if all values are identical (clone issue)
+            if ep_len > 1:
+                print(f"[DEBUG] env{ei}: v_cmd all_same={torch.allclose(v_cmd[0], v_cmd[-1])}, v_real all_same={torch.allclose(v_real[0], v_real[-1])}")
 
             fig, ax = plt.subplots(figsize=(8, 8))
             ax.plot(v_cmd[:, 0].numpy(), v_cmd[:, 1].numpy(),
@@ -239,7 +254,9 @@ def evaluate(
             info[f"eval/vel_tracking_env{ei}"] = wandb.Image(fig)
             plt.close(fig)
     except Exception as e:
+        import traceback
         print(f"[eval] vel tracking plot skipped: {e}")
+        traceback.print_exc()
 
     env.train()
     # env.reset()
