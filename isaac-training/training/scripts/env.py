@@ -517,6 +517,7 @@ class NavigationEnv(IsaacEnv):
     def _compute_state_and_obs(self):
         self.root_state = self.drone.get_state(env_frame=False) # (world_pos, orientation (quat), world_vel_and_angular, heading, up, 4motorsthrust)
         self.info["drone_state"][:] = self.root_state[..., :13] # info is for controller
+        self.info["vel_cmd"][:] = self.vel_cmd
 
         # >>>>>>>>>>>>The relevant code starts from here<<<<<<<<<<<<
         # -----------Network Input I: LiDAR range data--------------
