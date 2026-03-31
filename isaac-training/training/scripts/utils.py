@@ -253,6 +253,29 @@ def evaluate(
             fig.tight_layout()
             info[f"eval/vel_tracking_env{ei}"] = wandb.Image(fig)
             plt.close(fig)
+
+        # --- Export nominal transition data for degradation model fitting ---
+        export_path = getattr(cfg, 'nominal_data_path', None)
+        if export_path:
+            all_v_prev, all_u_prev, all_v_next = [], [], []
+            for ei in range(num_envs):
+                ep_len = first_done[ei].item() + 1
+                if ep_len < 2:
+                    continue
+                v_cmd = vel_cmd_all[ei, :ep_len, 0, :]   # (ep_len, 3)
+                v_real = vel_real_all[ei, :ep_len, 0, :]  # (ep_len, 3)
+                # Transition tuples: (v_{t-1}, u_{t-1}, v_t)
+                all_v_prev.append(v_real[:-1])
+                all_u_prev.append(v_cmd[:-1])
+                all_v_next.append(v_real[1:])
+            if all_v_prev:
+                torch.save({
+                    "v_prev": torch.cat(all_v_prev, dim=0),
+                    "u_prev": torch.cat(all_u_prev, dim=0),
+                    "v_next": torch.cat(all_v_next, dim=0),
+                }, export_path)
+                total = torch.cat(all_v_prev, dim=0).shape[0]
+                print(f"[eval] Nominal transition data saved: {total} samples -> {export_path}")
     except Exception as e:
         import traceback
         print(f"[eval] vel tracking plot skipped: {e}")
