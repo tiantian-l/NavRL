@@ -269,13 +269,21 @@ def evaluate(
                 all_u_prev.append(v_cmd[:-1])
                 all_v_next.append(v_real[1:])
             if all_v_prev:
+                new_v_prev = torch.cat(all_v_prev, dim=0)
+                new_u_prev = torch.cat(all_u_prev, dim=0)
+                new_v_next = torch.cat(all_v_next, dim=0)
+                # Append to existing file if it exists
+                if os.path.exists(export_path):
+                    existing = torch.load(export_path, map_location="cpu", weights_only=True)
+                    new_v_prev = torch.cat([existing["v_prev"], new_v_prev], dim=0)
+                    new_u_prev = torch.cat([existing["u_prev"], new_u_prev], dim=0)
+                    new_v_next = torch.cat([existing["v_next"], new_v_next], dim=0)
                 torch.save({
-                    "v_prev": torch.cat(all_v_prev, dim=0),
-                    "u_prev": torch.cat(all_u_prev, dim=0),
-                    "v_next": torch.cat(all_v_next, dim=0),
+                    "v_prev": new_v_prev,
+                    "u_prev": new_u_prev,
+                    "v_next": new_v_next,
                 }, export_path)
-                total = torch.cat(all_v_prev, dim=0).shape[0]
-                print(f"[eval] Nominal transition data saved: {total} samples -> {export_path}")
+                print(f"[eval] Nominal transition data: {new_v_prev.shape[0]} total samples -> {export_path}")
     except Exception as e:
         import traceback
         print(f"[eval] vel tracking plot skipped: {e}")
