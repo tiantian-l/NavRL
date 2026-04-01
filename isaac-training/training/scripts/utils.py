@@ -309,6 +309,83 @@ def evaluate(
         print(f"[eval] nominal data export failed: {e}")
         traceback.print_exc()
 
+    # --- Online degradation detection on eval trajectories ---
+    try:
+        deg_model_dir = getattr(cfg, 'deg_model_dir', None)
+        if deg_model_dir and os.path.isdir(deg_model_dir):
+            import sys as _sys
+            _dd_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                                   "degradation_detection")
+            if _dd_dir not in _sys.path:
+                _sys.path.insert(0, _dd_dir)
+            from degradation_detector import DegradationDetector
+            from transition_models import MLPTransitionModel, LinearTransitionModel
+
+            vel_cmd_all = trajs[("next", "info", "vel_cmd")].cpu()       # (num_envs, T, 1, 3)
+            drone_st_all = trajs[("next", "info", "drone_state")].cpu()  # (num_envs, T, 1, 13)
+            vel_real_all = drone_st_all[..., 7:10]                       # (num_envs, T, 1, 3)
+            num_envs = vel_cmd_all.shape[0]
+
+            deg_model_type = getattr(cfg, 'deg_model_type', 'mlp')
+            deg_window = int(getattr(cfg, 'deg_window', 20))
+
+            # Load model and detector
+            if deg_model_type == "linear":
+                model = LinearTransitionModel(device="cpu")
+                model.load(os.path.join(deg_model_dir, "linear_model.pt"))
+                det_path = os.path.join(deg_model_dir, "linear_detector.pt")
+            else:
+                model = MLPTransitionModel(device="cpu")
+                model.load(os.path.join(deg_model_dir, "mlp_model.pt"))
+                det_path = os.path.join(deg_model_dir, "mlp_detector.pt")
+
+            detector = DegradationDetector(model, window_size=deg_window, device="cpu")
+            if os.path.exists(det_path):
+                detector.load(det_path)
+
+            # Run detection per env
+            all_levels = []
+            all_anomaly_rates = []
+            all_max_C = []
+            for ei in range(num_envs):
+                ep_len = first_done[ei].item() + 1
+                if ep_len < 2:
+                    continue
+                v_cmd = vel_cmd_all[ei, :ep_len, 0, :]   # (ep_len, 3)
+                v_real = vel_real_all[ei, :ep_len, 0, :]  # (ep_len, 3)
+
+                detector.reset()
+                ep_A = []
+                ep_C = []
+                ep_levels = []
+                for t in range(1, ep_len):
+                    result = detector.step(v_real[t-1], v_cmd[t-1], v_real[t])
+                    ep_A.append(result["A_t"])
+                    ep_C.append(result["C_t"])
+                    ep_levels.append(result["level"])
+
+                if ep_A:
+                    ep_A_t = torch.tensor(ep_A)
+                    anomaly_rate = (ep_A_t > detector.tau_point).float().mean().item()
+                    max_C = max(ep_C)
+                    max_level = max(ep_levels)
+                    all_anomaly_rates.append(anomaly_rate)
+                    all_max_C.append(max_C)
+                    all_levels.append(max_level)
+                    print(f"[eval-deg] env{ei}: A_mean={ep_A_t.mean():.3f}, "
+                          f"anomaly_rate={anomaly_rate:.3f}, max_C={max_C}, max_level={max_level}")
+
+            if all_anomaly_rates:
+                info["eval/deg_anomaly_rate"] = sum(all_anomaly_rates) / len(all_anomaly_rates)
+                info["eval/deg_max_C"] = sum(all_max_C) / len(all_max_C)
+                info["eval/deg_max_level"] = max(all_levels)
+                print(f"[eval-deg] avg anomaly_rate={info['eval/deg_anomaly_rate']:.4f}, "
+                      f"avg max_C={info['eval/deg_max_C']:.1f}, worst_level={info['eval/deg_max_level']}")
+    except Exception as e:
+        import traceback
+        print(f"[eval] degradation detection skipped: {e}")
+        traceback.print_exc()
+
     env.train()
     # env.reset()
 

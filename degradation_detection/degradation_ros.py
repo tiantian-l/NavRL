@@ -1,15 +1,19 @@
 """
-ROS Degradation Detector Node — online degradation monitoring for deployment.
+ROS Degradation Detector — online degradation monitoring for deployment.
+
+Method: Max-Z anomaly score + count-based persistence detection.
+  A_t = max(|r_x|/σ_x, |r_y|/σ_y, |r_z|/σ_z)   single-step anomaly score
+  a_t = 1 if A_t > tau_point                       binary flag
+  C_t = count of anomalies in window W              persistence metric
 
 Works with both ROS1 and ROS2 navigation_runner.
-Standalone usage: import and call in the control loop.
 
 Example integration in navigation.py control_callback:
     from degradation_ros import ROSDegradationMonitor
     self.deg_monitor = ROSDegradationMonitor(model_dir, model_type="mlp", device="cpu")
 
     # In control_callback, after getting vel_world and safe_cmd_vel_world:
-    result = self.deg_monitor.step(vel_world_prev, cmd_vel_prev, vel_world_current)
+    result = self.deg_monitor.step(vel_world_current, cmd_vel_current)
 """
 
 import os
@@ -36,13 +40,6 @@ class ROSDegradationMonitor:
 
     def __init__(self, model_dir: str, model_type: str = "mlp",
                  window_size: int = 20, device: str = "cpu"):
-        """
-        Args:
-            model_dir: directory containing linear_model.pt / mlp_model.pt and detector files
-            model_type: "linear" or "mlp"
-            window_size: sliding window W
-            device: "cpu" or "cuda:0"
-        """
         self.device = device
         self.model_type = model_type
 
@@ -66,27 +63,27 @@ class ROSDegradationMonitor:
             self.detector.load(det_path)
 
         # Internal state
-        self._prev_vel = None  # (3,) torch tensor
-        self._prev_cmd = None  # (3,) torch tensor
+        self._prev_vel = None
+        self._prev_cmd = None
         self._initialized = False
 
         print(f"[DegMonitor] Loaded {model_type} model from {model_dir}")
-        print(f"[DegMonitor] Thresholds: {self.detector.thresholds}")
-        print(f"[DegMonitor] Window size: {window_size}")
+        print(f"[DegMonitor] tau_point={self.detector.tau_point:.4f}, "
+              f"C_levels={self.detector.C_levels}, W={self.detector.W}")
+        print(f"[DegMonitor] sigma={self.detector.sigma.tolist()}")
 
     def step(self, vel_world: np.ndarray, cmd_vel_world: np.ndarray) -> dict:
         """
         Process one control step.
 
         Args:
-            vel_world: current velocity in world frame, shape (3,), numpy or torch
+            vel_world: current velocity in world frame, shape (3,)
             cmd_vel_world: current velocity command (after safe action), shape (3,)
 
         Returns:
-            dict with D_inst, D_window, level, residual.
+            dict with A_t, a_t, C_t, level, residual, z.
             Returns None if not enough history yet (first step).
         """
-        # Convert to torch
         if isinstance(vel_world, np.ndarray):
             vel_world = torch.tensor(vel_world, dtype=torch.float32, device=self.device)
         if isinstance(cmd_vel_world, np.ndarray):
@@ -97,7 +94,6 @@ class ROSDegradationMonitor:
 
         result = None
         if self._initialized:
-            # We have v_{t-1} and u_{t-1}, current v_t is vel_world
             result = self.detector.step(self._prev_vel, self._prev_cmd, vel_world)
 
         # Update internal state for next step
@@ -119,4 +115,4 @@ class ROSDegradationMonitor:
         """Current degradation level (0-3)."""
         if not self._initialized:
             return 0
-        return 0  # Will be updated after first step call
+        return 0

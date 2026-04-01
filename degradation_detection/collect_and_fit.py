@@ -74,10 +74,11 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     linear_stats = linear_detector.compute_thresholds(
         v_prev[val_idx].to(device), u_prev[val_idx].to(device), v_next[val_idx].to(device)
     )
-    print(f"  D_inst  mean={linear_stats['D_inst_mean']:.4f}  std={linear_stats['D_inst_std']:.4f}")
-    print(f"  D_window mean={linear_stats['D_window_mean']:.4f}  std={linear_stats['D_window_std']:.4f}")
-    print(f"  Thresholds: q95={linear_stats['q95']:.4f}  q99={linear_stats['q99']:.4f}  q999={linear_stats['q999']:.4f}")
-    print(f"  Chi2 reference: 95%={linear_stats['chi2_95']:.4f}  99%={linear_stats['chi2_99']:.4f}")
+    print(f"  sigma = {linear_stats['sigma']}")
+    print(f"  A_t  mean={linear_stats['A_mean']:.4f}  std={linear_stats['A_std']:.4f}")
+    print(f"  tau_point (q99) = {linear_stats['tau_point']:.4f}")
+    print(f"  p_nominal = {linear_stats['p_nominal']:.4f}")
+    print(f"  C_levels (warn/degrade/severe) = {linear_stats['C_levels']}")
 
     linear_det_path = os.path.join(output_dir, "linear_detector.pt")
     linear_detector.save(linear_det_path)
@@ -108,9 +109,11 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     mlp_stats = mlp_detector.compute_thresholds(
         v_prev[val_idx].to(device), u_prev[val_idx].to(device), v_next[val_idx].to(device)
     )
-    print(f"  D_inst  mean={mlp_stats['D_inst_mean']:.4f}  std={mlp_stats['D_inst_std']:.4f}")
-    print(f"  D_window mean={mlp_stats['D_window_mean']:.4f}  std={mlp_stats['D_window_std']:.4f}")
-    print(f"  Thresholds: q95={mlp_stats['q95']:.4f}  q99={mlp_stats['q99']:.4f}  q999={mlp_stats['q999']:.4f}")
+    print(f"  sigma = {mlp_stats['sigma']}")
+    print(f"  A_t  mean={mlp_stats['A_mean']:.4f}  std={mlp_stats['A_std']:.4f}")
+    print(f"  tau_point (q99) = {mlp_stats['tau_point']:.4f}")
+    print(f"  p_nominal = {mlp_stats['p_nominal']:.4f}")
+    print(f"  C_levels (warn/degrade/severe) = {mlp_stats['C_levels']}")
 
     mlp_det_path = os.path.join(output_dir, "mlp_detector.pt")
     mlp_detector.save(mlp_det_path)
@@ -120,8 +123,11 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     print(f"  {'Metric':<25} {'Linear':>12} {'MLP':>12}")
     print(f"  {'Val MSE':<25} {val_mse:>12.6f} {val_mse_mlp:>12.6f}")
     print(f"  {'Q trace':<25} {result['Q'].trace().item():>12.6f} {mlp_result['Q'].trace().item():>12.6f}")
-    print(f"  {'D_window q95':<25} {linear_stats['q95']:>12.4f} {mlp_stats['q95']:>12.4f}")
-    print(f"  {'D_window q99':<25} {linear_stats['q99']:>12.4f} {mlp_stats['q99']:>12.4f}")
+    print(f"  {'tau_point':<25} {linear_stats['tau_point']:>12.4f} {mlp_stats['tau_point']:>12.4f}")
+    print(f"  {'A_t q99':<25} {linear_stats['A_q99']:>12.4f} {mlp_stats['A_q99']:>12.4f}")
+    linear_cl = linear_stats['C_levels']
+    mlp_cl = mlp_stats['C_levels']
+    print(f"  {'C_levels':<25} {str(linear_cl):>12} {str(mlp_cl):>12}")
 
     print(f"\nAll models saved to {output_dir}/")
     return {

@@ -1,11 +1,18 @@
 """
-Online Degradation Detector using likelihood-based Markov transition residuals.
+Online Degradation Detector using Max-Z anomaly score + count-based persistence.
 
-Given a fitted nominal model (Linear or MLP), computes:
-  - Instantaneous degradation score:  D_t = r_t^T Q^{-1} r_t   (Mahalanobis distance squared)
-  - Windowed degradation score:       D_t^{(W)} = mean(D_{t-W+1}, ..., D_t)
+Method:
+  Step 1 — Single-point anomaly detection:
+    r_t = v_t - f(v_{t-1}, u_{t-1})          residual
+    z_i = |r_i| / sigma_i                     per-axis standardized residual
+    A_t = max(z_x, z_y, z_z)                  anomaly score (worst-axis deviation)
+    a_t = 1 if A_t > tau_point else 0         binary anomaly flag
 
-Provides threshold computation from nominal data for chi-squared / empirical percentiles.
+  Step 2 — Temporal persistence detection:
+    C_t = sum(a_{t-W+1}, ..., a_t)            anomaly count in window W
+    level = f(C_t)                            degradation level (0-3)
+
+Thresholds computed from nominal validation data (empirical quantiles).
 """
 
 import torch
@@ -16,177 +23,173 @@ from transition_models import LinearTransitionModel, MLPTransitionModel
 
 class DegradationDetector:
     """
-    Online degradation detector.
+    Online degradation detector (single environment).
 
     Usage:
         detector = DegradationDetector(model, window_size=20)
         detector.compute_thresholds(nominal_data)   # offline
         ...
         for each control step:
-            score, level = detector.step(v_prev, u_prev, v_next)
+            result = detector.step(v_prev, u_prev, v_next)
     """
 
     def __init__(self, model, window_size: int = 20, device: str = "cpu"):
-        """
-        Args:
-            model: a fitted LinearTransitionModel or MLPTransitionModel
-            window_size: W for sliding window averaging
-            device: torch device
-        """
         self.model = model
         self.W = window_size
         self.device = device
 
-        # Q_inv from the fitted model
-        if isinstance(model, LinearTransitionModel):
-            self.Q_inv = model.Q_inv.to(device)
-        else:
-            self.Q_inv = model.Q_inv.to(device)
+        # Per-axis residual std from model's Q diagonal
+        Q = model.Q.to(device)
+        self.sigma = torch.sqrt(Q.diag()).clamp(min=1e-8)  # (d,)
 
-        # Ring buffer for instantaneous scores
-        self._scores_buf = torch.zeros(window_size, device=device)
+        # Ring buffer for binary anomaly flags
+        self._flag_buf = torch.zeros(window_size, dtype=torch.long, device=device)
+        self._score_buf = torch.zeros(window_size, device=device)  # A_t values
         self._buf_ptr = 0
         self._buf_filled = 0
 
         # Thresholds (set by compute_thresholds)
-        self.thresholds = {
-            "q95": float("inf"),
-            "q99": float("inf"),
-            "q999": float("inf"),
-        }
-
-    def _mahalanobis_sq(self, r: torch.Tensor) -> torch.Tensor:
-        """Compute r^T Q^{-1} r for a single residual vector (d,) or batch (N, d)."""
-        if r.dim() == 1:
-            return r @ self.Q_inv @ r
-        # Batched: (N, d) @ (d, d) -> (N, d), then sum
-        return (r @ self.Q_inv * r).sum(dim=-1)
+        self.tau_point = float("inf")       # single-step A_t threshold
+        self.C_levels = [4, 8, 14]          # count thresholds for levels 1,2,3
 
     def step(self, v_prev: torch.Tensor, u_prev: torch.Tensor,
              v_next: torch.Tensor) -> dict:
         """
         Process one control step.
 
-        Args:
-            v_prev: (3,) or (1,3) previous velocity
-            u_prev: (3,) or (1,3) velocity command
-            v_next: (3,) or (1,3) current velocity
-
         Returns:
-            dict with keys: D_inst, D_window, residual, level
+            dict with keys: A_t, a_t, C_t, level, residual, z
         """
         v_prev = v_prev.view(-1).to(self.device)
         u_prev = u_prev.view(-1).to(self.device)
         v_next = v_next.view(-1).to(self.device)
 
-        # Residual
-        if isinstance(self.model, LinearTransitionModel):
-            v_hat = self.model.predict(v_prev.unsqueeze(0), u_prev.unsqueeze(0)).squeeze(0)
-        else:
-            v_hat = self.model.predict(v_prev.unsqueeze(0), u_prev.unsqueeze(0)).squeeze(0)
-
+        # Predict and compute residual
+        v_hat = self.model.predict(v_prev.unsqueeze(0), u_prev.unsqueeze(0)).squeeze(0)
         r = v_next - v_hat
 
-        # Instantaneous score
-        D_inst = self._mahalanobis_sq(r).item()
+        # Standardized residual per axis
+        z = torch.abs(r) / self.sigma           # (d,)
+        A_t = z.max().item()                     # max-z score
+
+        # Binary anomaly flag
+        a_t = 1 if A_t > self.tau_point else 0
 
         # Update ring buffer
-        self._scores_buf[self._buf_ptr] = D_inst
+        self._flag_buf[self._buf_ptr] = a_t
+        self._score_buf[self._buf_ptr] = A_t
         self._buf_ptr = (self._buf_ptr + 1) % self.W
         self._buf_filled = min(self._buf_filled + 1, self.W)
 
-        # Windowed score
-        D_window = self._scores_buf[:self._buf_filled].mean().item()
+        # Anomaly count in window
+        C_t = self._flag_buf[:self._buf_filled].sum().item()
 
-        # Degradation level
+        # Degradation level from count
         level = 0
-        if D_window >= self.thresholds["q999"]:
+        if C_t >= self.C_levels[2]:
             level = 3
-        elif D_window >= self.thresholds["q99"]:
+        elif C_t >= self.C_levels[1]:
             level = 2
-        elif D_window >= self.thresholds["q95"]:
+        elif C_t >= self.C_levels[0]:
             level = 1
 
         return {
-            "D_inst": D_inst,
-            "D_window": D_window,
-            "residual": r.detach().cpu(),
+            "A_t": A_t,
+            "a_t": a_t,
+            "C_t": int(C_t),
             "level": level,
+            "residual": r.detach().cpu(),
+            "z": z.detach().cpu(),
         }
 
     def compute_thresholds(self, v_prev: torch.Tensor, u_prev: torch.Tensor,
                            v_next: torch.Tensor):
         """
-        Compute empirical thresholds from nominal data using the windowed score distribution.
+        Compute empirical thresholds from nominal validation data.
 
-        Args:
-            v_prev, u_prev, v_next: (N, d) tensors of nominal transitions
+        Sets:
+          - tau_point: q99 of A_t distribution (single-step threshold)
+          - C_levels: based on nominal anomaly rate p and Binomial distribution
         """
         v_prev = v_prev.to(self.device)
         u_prev = u_prev.to(self.device)
         v_next = v_next.to(self.device)
 
-        # Compute all instantaneous scores
-        if isinstance(self.model, LinearTransitionModel):
-            residuals = self.model.residual(v_prev, u_prev, v_next)
-        else:
-            residuals = self.model.residual(v_prev, u_prev, v_next)
+        # Compute all residuals
+        residuals = self.model.residual(v_prev, u_prev, v_next)  # (N, d)
 
-        D_all = self._mahalanobis_sq(residuals)  # (N,)
+        # Per-axis standardized residuals
+        z_all = torch.abs(residuals) / self.sigma.unsqueeze(0)   # (N, d)
+        A_all = z_all.max(dim=-1).values                         # (N,)
 
-        # Compute windowed scores via convolution
-        N = D_all.shape[0]
+        # Point threshold: q99 of A_t
+        self.tau_point = float(torch.quantile(A_all, 0.99).item())
+
+        # Compute nominal anomaly rate
+        a_all = (A_all > self.tau_point).long()
+        p_nominal = a_all.float().mean().item()  # should be ~0.01
+
+        # Compute windowed anomaly counts on nominal data
+        N = A_all.shape[0]
         if N >= self.W:
-            # Moving average with window W
-            D_cumsum = torch.cumsum(D_all, dim=0)
-            D_windowed = (D_cumsum[self.W - 1:] - torch.cat([torch.zeros(1, device=self.device), D_cumsum[:-1]])[: N - self.W + 1]) / self.W
-            # Simpler: use unfold
-            D_windowed = D_all.unfold(0, self.W, 1).mean(dim=-1)
+            a_windows = a_all.unfold(0, self.W, 1)       # (N-W+1, W)
+            C_all = a_windows.sum(dim=-1)                  # (N-W+1,)
+            # Set C_levels from empirical quantiles of C distribution
+            c95 = int(torch.quantile(C_all.float(), 0.95).item()) + 1
+            c99 = int(torch.quantile(C_all.float(), 0.99).item()) + 1
+            c999 = int(torch.quantile(C_all.float(), 0.999).item()) + 1
+            # Ensure monotonic and at least 2
+            self.C_levels = [max(c95, 2), max(c99, c95 + 1), max(c999, c99 + 1)]
         else:
-            D_windowed = D_all
-
-        self.thresholds["q95"] = torch.quantile(D_windowed, 0.95).item()
-        self.thresholds["q99"] = torch.quantile(D_windowed, 0.99).item()
-        self.thresholds["q999"] = torch.quantile(D_windowed, 0.999).item()
-
-        # Also store chi-squared reference (theoretical, for state_dim degrees of freedom)
-        d = v_prev.shape[-1]
-        from scipy.stats import chi2
-        self.thresholds["chi2_95"] = chi2.ppf(0.95, d)
-        self.thresholds["chi2_99"] = chi2.ppf(0.99, d)
+            self.C_levels = [4, 8, 14]
 
         stats = {
-            "D_inst_mean": D_all.mean().item(),
-            "D_inst_std": D_all.std().item(),
-            "D_window_mean": D_windowed.mean().item(),
-            "D_window_std": D_windowed.std().item(),
-            **self.thresholds,
+            "tau_point": self.tau_point,
+            "p_nominal": p_nominal,
+            "C_levels": self.C_levels,
+            "A_mean": A_all.mean().item(),
+            "A_std": A_all.std().item(),
+            "A_q95": torch.quantile(A_all, 0.95).item(),
+            "A_q99": torch.quantile(A_all, 0.99).item(),
+            "A_q999": torch.quantile(A_all, 0.999).item(),
+            "sigma": self.sigma.cpu().tolist(),
         }
+        if N >= self.W:
+            stats["C_mean"] = C_all.float().mean().item()
+            stats["C_std"] = C_all.float().std().item()
         return stats
 
     def reset(self):
         """Reset the ring buffer (e.g. at episode start)."""
-        self._scores_buf.zero_()
+        self._flag_buf.zero_()
+        self._score_buf.zero_()
         self._buf_ptr = 0
         self._buf_filled = 0
 
     def save(self, path: str):
-        # Convert all threshold values to plain Python floats for safe serialization
-        safe_thresholds = {k: float(v) for k, v in self.thresholds.items()}
-        torch.save({"thresholds": safe_thresholds, "W": int(self.W)}, path)
+        torch.save({
+            "tau_point": float(self.tau_point),
+            "C_levels": [int(c) for c in self.C_levels],
+            "sigma": self.sigma.cpu(),
+            "W": int(self.W),
+        }, path)
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
-        self.thresholds = {k: float(v) for k, v in ckpt["thresholds"].items()}
+        self.tau_point = float(ckpt["tau_point"])
+        self.C_levels = [int(c) for c in ckpt["C_levels"]]
+        if "sigma" in ckpt:
+            self.sigma = ckpt["sigma"].to(self.device)
         self.W = int(ckpt["W"])
-        self._scores_buf = torch.zeros(self.W, device=self.device)
+        self._flag_buf = torch.zeros(self.W, dtype=torch.long, device=self.device)
+        self._score_buf = torch.zeros(self.W, device=self.device)
 
 
 class BatchDegradationDetector:
     """
-    Vectorized detector for parallel environments (Isaac Sim training).
+    Vectorized detector for parallel environments (Isaac Sim eval/training).
 
-    Maintains per-environment ring buffers.
+    Maintains per-environment ring buffers of binary anomaly flags.
     """
 
     def __init__(self, model, num_envs: int, window_size: int = 20, device: str = "cpu"):
@@ -195,21 +198,17 @@ class BatchDegradationDetector:
         self.W = window_size
         self.device = device
 
-        if isinstance(model, LinearTransitionModel):
-            self.Q_inv = model.Q_inv.to(device)
-        else:
-            self.Q_inv = model.Q_inv.to(device)
+        Q = model.Q.to(device)
+        self.sigma = torch.sqrt(Q.diag()).clamp(min=1e-8)  # (d,)
 
         # Ring buffers: (num_envs, W)
-        self._scores_buf = torch.zeros(num_envs, window_size, device=device)
+        self._flag_buf = torch.zeros(num_envs, window_size, dtype=torch.long, device=device)
+        self._score_buf = torch.zeros(num_envs, window_size, device=device)
         self._buf_ptr = torch.zeros(num_envs, dtype=torch.long, device=device)
         self._buf_filled = torch.zeros(num_envs, dtype=torch.long, device=device)
 
-        self.thresholds = {"q95": float("inf"), "q99": float("inf"), "q999": float("inf")}
-
-    def _mahalanobis_sq_batch(self, r: torch.Tensor) -> torch.Tensor:
-        """r: (num_envs, d) -> (num_envs,)"""
-        return (r @ self.Q_inv * r).sum(dim=-1)
+        self.tau_point = float("inf")
+        self.C_levels = [4, 8, 14]
 
     def step(self, v_prev: torch.Tensor, u_prev: torch.Tensor,
              v_next: torch.Tensor) -> dict:
@@ -222,45 +221,48 @@ class BatchDegradationDetector:
             v_next: (num_envs, 3)
 
         Returns:
-            dict with D_inst (num_envs,), D_window (num_envs,), level (num_envs,)
+            dict with A_t (num_envs,), a_t (num_envs,), C_t (num_envs,), level (num_envs,)
         """
-        # Residuals
-        if isinstance(self.model, LinearTransitionModel):
-            v_hat = self.model.predict(v_prev, u_prev)
-        else:
-            v_hat = self.model.predict(v_prev, u_prev)
+        v_hat = self.model.predict(v_prev, u_prev)
         r = v_next - v_hat
 
-        # Instantaneous scores
-        D_inst = self._mahalanobis_sq_batch(r)  # (num_envs,)
+        # Per-axis standardized residual
+        z = torch.abs(r) / self.sigma.unsqueeze(0)          # (num_envs, d)
+        A_t = z.max(dim=-1).values                           # (num_envs,)
+
+        # Binary anomaly flags
+        a_t = (A_t > self.tau_point).long()                  # (num_envs,)
 
         # Update ring buffers
         idx = torch.arange(self.num_envs, device=self.device)
-        self._scores_buf[idx, self._buf_ptr] = D_inst
+        self._flag_buf[idx, self._buf_ptr] = a_t
+        self._score_buf[idx, self._buf_ptr] = A_t
         self._buf_ptr = (self._buf_ptr + 1) % self.W
         self._buf_filled = torch.clamp(self._buf_filled + 1, max=self.W)
 
-        # Windowed scores
-        filled = self._buf_filled.float().clamp(min=1)
-        D_window = self._scores_buf.sum(dim=-1) / filled
+        # Anomaly count in window
+        C_t = self._flag_buf.sum(dim=-1)                     # (num_envs,)
 
-        # Levels
+        # Degradation levels
         level = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        level[D_window >= self.thresholds["q95"]] = 1
-        level[D_window >= self.thresholds["q99"]] = 2
-        level[D_window >= self.thresholds["q999"]] = 3
+        level[C_t >= self.C_levels[0]] = 1
+        level[C_t >= self.C_levels[1]] = 2
+        level[C_t >= self.C_levels[2]] = 3
 
         return {
-            "D_inst": D_inst,
-            "D_window": D_window,
+            "A_t": A_t,
+            "a_t": a_t,
+            "C_t": C_t,
             "level": level,
         }
 
     def reset_envs(self, env_ids: torch.Tensor):
         """Reset buffers for specific environments."""
-        self._scores_buf[env_ids] = 0.0
+        self._flag_buf[env_ids] = 0
+        self._score_buf[env_ids] = 0.0
         self._buf_ptr[env_ids] = 0
         self._buf_filled[env_ids] = 0
 
-    def set_thresholds(self, thresholds: dict):
-        self.thresholds = thresholds
+    def set_thresholds(self, tau_point: float, C_levels: list):
+        self.tau_point = tau_point
+        self.C_levels = C_levels
