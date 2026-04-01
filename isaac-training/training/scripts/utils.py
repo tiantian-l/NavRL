@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import wandb
@@ -254,13 +255,27 @@ def evaluate(
             info[f"eval/vel_tracking_env{ei}"] = wandb.Image(fig)
             plt.close(fig)
 
-        # --- Export nominal transition data for degradation model fitting ---
+    except Exception as e:
+        import traceback
+        print(f"[eval] vel tracking plot skipped: {e}")
+        traceback.print_exc()
+
+    # --- Export nominal transition data for degradation model fitting ---
+    # (Separate try block so plotting errors don't block data export)
+    try:
         export_path = getattr(cfg, 'nominal_data_path', None)
+        print(f"[eval] nominal_data_path = {export_path}")
         if export_path:
+            vel_cmd_all = trajs[("next", "info", "vel_cmd")].cpu()       # (num_envs, T, 1, 3)
+            drone_st_all = trajs[("next", "info", "drone_state")].cpu()  # (num_envs, T, 1, 13)
+            vel_real_all = drone_st_all[..., 7:10]                       # (num_envs, T, 1, 3)
+            num_envs = vel_cmd_all.shape[0]
+
             all_v_prev, all_u_prev, all_v_next = [], [], []
             for ei in range(num_envs):
                 ep_len = first_done[ei].item() + 1
                 if ep_len < 2:
+                    print(f"[eval] env{ei}: ep_len={ep_len}, skipping (too short)")
                     continue
                 v_cmd = vel_cmd_all[ei, :ep_len, 0, :]   # (ep_len, 3)
                 v_real = vel_real_all[ei, :ep_len, 0, :]  # (ep_len, 3)
@@ -268,6 +283,7 @@ def evaluate(
                 all_v_prev.append(v_real[:-1])
                 all_u_prev.append(v_cmd[:-1])
                 all_v_next.append(v_real[1:])
+                print(f"[eval] env{ei}: ep_len={ep_len}, collected {ep_len-1} transitions")
             if all_v_prev:
                 new_v_prev = torch.cat(all_v_prev, dim=0)
                 new_u_prev = torch.cat(all_u_prev, dim=0)
@@ -284,9 +300,13 @@ def evaluate(
                     "v_next": new_v_next,
                 }, export_path)
                 print(f"[eval] Nominal transition data: {new_v_prev.shape[0]} total samples -> {export_path}")
+            else:
+                print("[eval] WARNING: no valid episodes found (all ep_len < 2)")
+        else:
+            print("[eval] nominal_data_path not set, skipping data export")
     except Exception as e:
         import traceback
-        print(f"[eval] vel tracking plot skipped: {e}")
+        print(f"[eval] nominal data export failed: {e}")
         traceback.print_exc()
 
     env.train()
