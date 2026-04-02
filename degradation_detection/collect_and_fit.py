@@ -41,13 +41,43 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     v_prev = data["v_prev"]  # (N, 3)
     u_prev = data["u_prev"]  # (N, 3)
     v_next = data["v_next"]  # (N, 3)
+    ep_lengths = data.get("ep_lengths", None)  # (num_episodes,) or None
     N = v_prev.shape[0]
     print(f"  Loaded {N} transition samples, state_dim={v_prev.shape[1]}")
+    if ep_lengths is not None:
+        print(f"  Episode info: {len(ep_lengths)} episodes, lengths: min={ep_lengths.min().item()}, "
+              f"max={ep_lengths.max().item()}, mean={ep_lengths.float().mean().item():.1f}")
 
-    # Shuffle and split: 90% train, 10% validation
-    perm = torch.randperm(N)
-    split = int(0.9 * N)
-    train_idx, val_idx = perm[:split], perm[split:]
+    # --- Train / validation split ---
+    if ep_lengths is not None and len(ep_lengths) > 1:
+        # Split by episode to preserve temporal structure in val set
+        num_eps = len(ep_lengths)
+        ep_perm = torch.randperm(num_eps)
+        ep_split = max(1, int(0.9 * num_eps))
+        train_ep_ids = ep_perm[:ep_split]
+        val_ep_ids = ep_perm[ep_split:]
+
+        # Compute sample indices for each episode
+        ep_offsets = torch.cat([torch.tensor([0]), ep_lengths.cumsum(0)])
+        train_idx = torch.cat([torch.arange(ep_offsets[i], ep_offsets[i] + ep_lengths[i]) for i in train_ep_ids])
+        val_idx = torch.cat([torch.arange(ep_offsets[i], ep_offsets[i] + ep_lengths[i]) for i in val_ep_ids])
+
+        # Val episode lengths (for episode-aware threshold computation)
+        val_ep_lengths = ep_lengths[val_ep_ids]
+        print(f"  Episode split: {len(train_ep_ids)} train eps ({len(train_idx)} samples), "
+              f"{len(val_ep_ids)} val eps ({len(val_idx)} samples)")
+    else:
+        # Fallback: random sample split (no episode info)
+        perm = torch.randperm(N)
+        split = int(0.9 * N)
+        train_idx, val_idx = perm[:split], perm[split:]
+        val_ep_lengths = None
+        print(f"  No episode info — random sample split: {len(train_idx)} train, {len(val_idx)} val")
+
+    # Build val data in episode order (contiguous per episode) for threshold computation
+    val_v_prev = v_prev[val_idx]
+    val_u_prev = u_prev[val_idx]
+    val_v_next = v_next[val_idx]
 
     # ========== 1. Linear Model ==========
     print("\n===== Fitting Linear Transition Model =====")
@@ -60,8 +90,8 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
 
     # Validation MSE
     with torch.no_grad():
-        val_pred = linear_model.predict(v_prev[val_idx].to(device), u_prev[val_idx].to(device))
-        val_mse = ((val_pred - v_next[val_idx].to(device)) ** 2).mean().item()
+        val_pred = linear_model.predict(val_v_prev.to(device), val_u_prev.to(device))
+        val_mse = ((val_pred - val_v_next.to(device)) ** 2).mean().item()
     print(f"  Validation MSE = {val_mse:.6f}")
 
     linear_path = os.path.join(output_dir, "linear_model.pt")
@@ -72,7 +102,8 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     print("  Computing thresholds ...")
     linear_detector = DegradationDetector(linear_model, window_size=window_size, device=device)
     linear_stats = linear_detector.compute_thresholds(
-        v_prev[val_idx].to(device), u_prev[val_idx].to(device), v_next[val_idx].to(device)
+        val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
+        ep_lengths=val_ep_lengths,
     )
     print(f"  sigma = {linear_stats['sigma']}")
     print(f"  A_t  mean={linear_stats['A_mean']:.4f}  std={linear_stats['A_std']:.4f}")
@@ -94,8 +125,8 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
 
     # Validation MSE
     with torch.no_grad():
-        val_pred_mlp = mlp_model.predict(v_prev[val_idx].to(device), u_prev[val_idx].to(device))
-        val_mse_mlp = ((val_pred_mlp - v_next[val_idx].to(device)) ** 2).mean().item()
+        val_pred_mlp = mlp_model.predict(val_v_prev.to(device), val_u_prev.to(device))
+        val_mse_mlp = ((val_pred_mlp - val_v_next.to(device)) ** 2).mean().item()
     print(f"  Validation MSE = {val_mse_mlp:.6f}")
     print(f"  Improvement over linear: {(1 - val_mse_mlp / val_mse) * 100:.1f}%")
 
@@ -107,7 +138,8 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     print("  Computing thresholds ...")
     mlp_detector = DegradationDetector(mlp_model, window_size=window_size, device=device)
     mlp_stats = mlp_detector.compute_thresholds(
-        v_prev[val_idx].to(device), u_prev[val_idx].to(device), v_next[val_idx].to(device)
+        val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
+        ep_lengths=val_ep_lengths,
     )
     print(f"  sigma = {mlp_stats['sigma']}")
     print(f"  A_t  mean={mlp_stats['A_mean']:.4f}  std={mlp_stats['A_std']:.4f}")

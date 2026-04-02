@@ -272,6 +272,7 @@ def evaluate(
             num_envs = vel_cmd_all.shape[0]
 
             all_v_prev, all_u_prev, all_v_next = [], [], []
+            ep_lengths = []  # number of transitions per episode (ep_len - 1)
             for ei in range(num_envs):
                 ep_len = first_done[ei].item() + 1
                 if ep_len < 2:
@@ -283,23 +284,28 @@ def evaluate(
                 all_v_prev.append(v_real[:-1])
                 all_u_prev.append(v_cmd[:-1])
                 all_v_next.append(v_real[1:])
+                ep_lengths.append(ep_len - 1)
                 print(f"[eval] env{ei}: ep_len={ep_len}, collected {ep_len-1} transitions")
             if all_v_prev:
                 new_v_prev = torch.cat(all_v_prev, dim=0)
                 new_u_prev = torch.cat(all_u_prev, dim=0)
                 new_v_next = torch.cat(all_v_next, dim=0)
+                new_ep_lengths = torch.tensor(ep_lengths, dtype=torch.long)
                 # Append to existing file if it exists
                 if os.path.exists(export_path):
                     existing = torch.load(export_path, map_location="cpu", weights_only=True)
                     new_v_prev = torch.cat([existing["v_prev"], new_v_prev], dim=0)
                     new_u_prev = torch.cat([existing["u_prev"], new_u_prev], dim=0)
                     new_v_next = torch.cat([existing["v_next"], new_v_next], dim=0)
+                    if "ep_lengths" in existing:
+                        new_ep_lengths = torch.cat([existing["ep_lengths"], new_ep_lengths], dim=0)
                 torch.save({
                     "v_prev": new_v_prev,
                     "u_prev": new_u_prev,
                     "v_next": new_v_next,
+                    "ep_lengths": new_ep_lengths,
                 }, export_path)
-                print(f"[eval] Nominal transition data: {new_v_prev.shape[0]} total samples -> {export_path}")
+                print(f"[eval] Nominal transition data: {new_v_prev.shape[0]} total samples, {new_ep_lengths.shape[0]} episodes -> {export_path}")
             else:
                 print("[eval] WARNING: no valid episodes found (all ep_len < 2)")
         else:

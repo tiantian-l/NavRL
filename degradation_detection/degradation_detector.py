@@ -103,9 +103,17 @@ class DegradationDetector:
         }
 
     def compute_thresholds(self, v_prev: torch.Tensor, u_prev: torch.Tensor,
-                           v_next: torch.Tensor):
+                           v_next: torch.Tensor,
+                           ep_lengths: Optional[torch.Tensor] = None):
         """
         Compute empirical thresholds from nominal validation data.
+
+        Args:
+            v_prev, u_prev, v_next: (N, d) flat tensors
+            ep_lengths: (num_episodes,) number of transitions per episode.
+                If provided, sliding windows are computed within each episode
+                (avoids cross-episode contamination). If None, falls back to
+                global unfold (backward compatible).
 
         Sets:
           - tau_point: q99 of A_t distribution (single-step threshold)
@@ -131,9 +139,24 @@ class DegradationDetector:
 
         # Compute windowed anomaly counts on nominal data
         N = A_all.shape[0]
-        if N >= self.W:
-            a_windows = a_all.unfold(0, self.W, 1)       # (N-W+1, W)
-            C_all = a_windows.sum(dim=-1)                  # (N-W+1,)
+        C_parts = []
+
+        if ep_lengths is not None and len(ep_lengths) > 0:
+            # Episode-aware windowing: only slide within each episode
+            offset = 0
+            for ep_len in ep_lengths.tolist():
+                ep_len = int(ep_len)
+                if ep_len >= self.W:
+                    a_ep = a_all[offset:offset + ep_len]
+                    C_ep = a_ep.unfold(0, self.W, 1).sum(dim=-1)  # (ep_len - W + 1,)
+                    C_parts.append(C_ep)
+                offset += ep_len
+        elif N >= self.W:
+            # Fallback: global unfold (no episode info available)
+            C_parts.append(a_all.unfold(0, self.W, 1).sum(dim=-1))
+
+        if C_parts:
+            C_all = torch.cat(C_parts, dim=0)
             # Set C_levels from empirical quantiles of C distribution
             c95 = int(torch.quantile(C_all.float(), 0.95).item()) + 1
             c99 = int(torch.quantile(C_all.float(), 0.99).item()) + 1
@@ -154,9 +177,10 @@ class DegradationDetector:
             "A_q999": torch.quantile(A_all, 0.999).item(),
             "sigma": self.sigma.cpu().tolist(),
         }
-        if N >= self.W:
+        if C_parts:
             stats["C_mean"] = C_all.float().mean().item()
             stats["C_std"] = C_all.float().std().item()
+            stats["C_num_windows"] = C_all.shape[0]
         return stats
 
     def reset(self):
