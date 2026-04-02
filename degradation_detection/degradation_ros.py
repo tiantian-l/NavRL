@@ -68,8 +68,9 @@ class ROSDegradationMonitor:
         self._initialized = False
 
         print(f"[DegMonitor] Loaded {model_type} model from {model_dir}")
-        print(f"[DegMonitor] tau_point={self.detector.tau_point:.4f}, "
+        print(f"[DegMonitor] tau_point={self.detector.tau_point:.4f} (alpha={self.detector.alpha:.1e}), "
               f"C_levels={self.detector.C_levels}, W={self.detector.W}")
+        print(f"[DegMonitor] mu={self.detector.mu.tolist()}")
         print(f"[DegMonitor] sigma={self.detector.sigma.tolist()}")
 
     def step(self, vel_world: np.ndarray, cmd_vel_world: np.ndarray) -> dict:

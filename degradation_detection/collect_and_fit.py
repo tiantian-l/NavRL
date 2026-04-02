@@ -22,8 +22,25 @@ from transition_models import LinearTransitionModel, MLPTransitionModel
 from degradation_detector import DegradationDetector
 
 
+def _print_threshold_stats(label: str, s: dict):
+    """Pretty-print threshold computation results."""
+    print(f"  --- {label} Threshold Report ---")
+    print(f"  mu    = [{s['mu'][0]:.6f}, {s['mu'][1]:.6f}, {s['mu'][2]:.6f}]")
+    print(f"  sigma = [{s['sigma'][0]:.6f}, {s['sigma'][1]:.6f}, {s['sigma'][2]:.6f}]")
+    print(f"  alpha (target)     = {s['alpha']:.1e}")
+    print(f"  tau   (theoretical)= {s['tau_theory']:.4f}")
+    print(f"  p_actual           = {s['p_actual']:.6f}  (ratio to alpha: {s['p_ratio']:.2f}x)")
+    if s['p_ratio'] > 3.0:
+        print(f"  ⚠ Heavy-tail warning: actual FP rate is {s['p_ratio']:.1f}x higher than Gaussian prediction")
+    print(f"  A_t  mean={s['A_mean']:.4f}  std={s['A_std']:.4f}  q99={s['A_q99']:.4f}")
+    print(f"  C_levels (warn/degrade/severe) = {s['C_levels']}")
+    if 'C_mean' in s:
+        print(f"  C_t  mean={s['C_mean']:.4f}  std={s['C_std']:.4f}  ({s['C_num_windows']} windows)")
+
+
 def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
-                 mlp_epochs: int = 1000, mlp_hidden: int = 32, window_size: int = 20):
+                 mlp_epochs: int = 1000, mlp_hidden: int = 32, window_size: int = 20,
+                 alpha: float = 1e-3):
     """
     Load nominal data, fit both models, compute thresholds, save everything.
 
@@ -34,6 +51,7 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
         mlp_epochs: training epochs for MLP
         mlp_hidden: MLP hidden layer width
         window_size: W for degradation detector sliding window
+        alpha: single-step false-positive rate for theoretical threshold
     """
     os.makedirs(output_dir, exist_ok=True)
     print(f"Loading nominal data from {data_path} ...")
@@ -103,13 +121,9 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     linear_detector = DegradationDetector(linear_model, window_size=window_size, device=device)
     linear_stats = linear_detector.compute_thresholds(
         val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
-        ep_lengths=val_ep_lengths,
+        ep_lengths=val_ep_lengths, alpha=alpha,
     )
-    print(f"  sigma = {linear_stats['sigma']}")
-    print(f"  A_t  mean={linear_stats['A_mean']:.4f}  std={linear_stats['A_std']:.4f}")
-    print(f"  tau_point (q99) = {linear_stats['tau_point']:.4f}")
-    print(f"  p_nominal = {linear_stats['p_nominal']:.4f}")
-    print(f"  C_levels (warn/degrade/severe) = {linear_stats['C_levels']}")
+    _print_threshold_stats("Linear", linear_stats)
 
     linear_det_path = os.path.join(output_dir, "linear_detector.pt")
     linear_detector.save(linear_det_path)
@@ -139,13 +153,9 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     mlp_detector = DegradationDetector(mlp_model, window_size=window_size, device=device)
     mlp_stats = mlp_detector.compute_thresholds(
         val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
-        ep_lengths=val_ep_lengths,
+        ep_lengths=val_ep_lengths, alpha=alpha,
     )
-    print(f"  sigma = {mlp_stats['sigma']}")
-    print(f"  A_t  mean={mlp_stats['A_mean']:.4f}  std={mlp_stats['A_std']:.4f}")
-    print(f"  tau_point (q99) = {mlp_stats['tau_point']:.4f}")
-    print(f"  p_nominal = {mlp_stats['p_nominal']:.4f}")
-    print(f"  C_levels (warn/degrade/severe) = {mlp_stats['C_levels']}")
+    _print_threshold_stats("MLP", mlp_stats)
 
     mlp_det_path = os.path.join(output_dir, "mlp_detector.pt")
     mlp_detector.save(mlp_det_path)
@@ -155,8 +165,10 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     print(f"  {'Metric':<25} {'Linear':>12} {'MLP':>12}")
     print(f"  {'Val MSE':<25} {val_mse:>12.6f} {val_mse_mlp:>12.6f}")
     print(f"  {'Q trace':<25} {result['Q'].trace().item():>12.6f} {mlp_result['Q'].trace().item():>12.6f}")
-    print(f"  {'tau_point':<25} {linear_stats['tau_point']:>12.4f} {mlp_stats['tau_point']:>12.4f}")
-    print(f"  {'A_t q99':<25} {linear_stats['A_q99']:>12.4f} {mlp_stats['A_q99']:>12.4f}")
+    print(f"  {'tau (theory)':<25} {linear_stats['tau_theory']:>12.4f} {mlp_stats['tau_theory']:>12.4f}")
+    print(f"  {'p_actual':<25} {linear_stats['p_actual']:>12.6f} {mlp_stats['p_actual']:>12.6f}")
+    print(f"  {'p_ratio (actual/alpha)':<25} {linear_stats['p_ratio']:>12.2f} {mlp_stats['p_ratio']:>12.2f}")
+    print(f"  {'A_t q99 (empirical)':<25} {linear_stats['A_q99']:>12.4f} {mlp_stats['A_q99']:>12.4f}")
     linear_cl = linear_stats['C_levels']
     mlp_cl = mlp_stats['C_levels']
     print(f"  {'C_levels':<25} {str(linear_cl):>12} {str(mlp_cl):>12}")
@@ -284,6 +296,8 @@ if __name__ == "__main__":
     parser.add_argument("--mlp_hidden", type=int, default=32)
     parser.add_argument("--window_size", type=int, default=20,
                         help="Sliding window W for degradation score")
+    parser.add_argument("--alpha", type=float, default=1e-3,
+                        help="Single-step false-positive rate (default: 1e-3, tau≈3.4)")
 
     args = parser.parse_args()
     fit_and_save(
@@ -293,4 +307,5 @@ if __name__ == "__main__":
         mlp_epochs=args.mlp_epochs,
         mlp_hidden=args.mlp_hidden,
         window_size=args.window_size,
+        alpha=args.alpha,
     )
