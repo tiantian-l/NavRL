@@ -28,6 +28,7 @@ if _dd_dir not in sys.path:
 
 from transition_models import LinearTransitionModel, MLPTransitionModel
 from degradation_detector import DegradationDetector
+from residual_model import HeteroscedasticMLP
 
 
 class ROSDegradationMonitor:
@@ -36,6 +37,8 @@ class ROSDegradationMonitor:
 
     Maintains (v_{t-1}, u_{t-1}) state internally, so the caller just needs to
     provide current velocity and current command each step.
+
+    Supports optional input-dependent residual model for locally-adaptive z-scores.
     """
 
     def __init__(self, model_dir: str, model_type: str = "mlp",
@@ -57,8 +60,23 @@ class ROSDegradationMonitor:
         else:
             raise ValueError(f"model_type must be 'linear' or 'mlp', got '{model_type}'")
 
+        # Load residual model if available
+        res_model = None
+        rm_model_path = os.path.join(model_dir, "residual_model.pt")
+        rm_det_path = os.path.join(model_dir, "mlp_detector_rm.pt")
+        if os.path.exists(rm_model_path):
+            res_model = HeteroscedasticMLP(input_dim=6, output_dim=3, device=device)
+            res_model.load(rm_model_path)
+            # Use the detector trained with residual model
+            if os.path.exists(rm_det_path):
+                det_path = rm_det_path
+            print(f"[DegMonitor] Loaded residual model from {rm_model_path}")
+
         # Create detector
-        self.detector = DegradationDetector(self.model, window_size=window_size, device=device)
+        self.detector = DegradationDetector(
+            self.model, window_size=window_size, device=device,
+            residual_model=res_model,
+        )
         if os.path.exists(det_path):
             self.detector.load(det_path)
 
@@ -72,6 +90,7 @@ class ROSDegradationMonitor:
               f"C_levels={self.detector.C_levels}, W={self.detector.W}")
         print(f"[DegMonitor] mu={self.detector.mu.tolist()}")
         print(f"[DegMonitor] sigma={self.detector.sigma.tolist()}")
+        print(f"[DegMonitor] residual_model={'HeteroscedasticMLP' if res_model else 'None (global sigma)'}")
 
     def step(self, vel_world: np.ndarray, cmd_vel_world: np.ndarray) -> dict:
         """

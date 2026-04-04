@@ -17,6 +17,13 @@ Thresholds:
               tau = Phi^{-1}(1 - alpha/6)  (Bonferroni for d=3 axes)
               Validated against empirical false-positive rate on nominal data.
   C_levels  — from Binomial(W, p) survival function, where p = actual anomaly rate.
+
+Optional: input-dependent residual model
+  If a residual_model (HeteroscedasticMLP or SparseGPResidualModel) is provided,
+  the detector uses locally-adaptive z-scores:
+    mu(x_t), sigma(x_t) = residual_model.predict(x_t)
+    z_i = |r_{t,i} - mu_i(x_t)| / sigma_i(x_t)
+  This resolves heavy-tail issues caused by heteroscedastic residuals.
 """
 
 import torch
@@ -81,6 +88,9 @@ class DegradationDetector:
     Thresholds are set via theoretical Gaussian + Binomial model,
     then validated on nominal data (empirical false-positive rate).
 
+    If residual_model is provided, uses input-dependent mu(x) and sigma(x)
+    for locally-adaptive z-scores. Otherwise falls back to global statistics.
+
     Usage:
         detector = DegradationDetector(model, window_size=20)
         detector.compute_thresholds(nominal_data, alpha=1e-3)
@@ -89,13 +99,15 @@ class DegradationDetector:
             result = detector.step(v_prev, u_prev, v_next)
     """
 
-    def __init__(self, model, window_size: int = 20, device: str = "cpu"):
+    def __init__(self, model, window_size: int = 20, device: str = "cpu",
+                 residual_model=None):
         self.model = model
         self.W = window_size
         self.device = device
         self.d = 3  # state dimension
+        self.residual_model = residual_model  # optional input-dependent model
 
-        # Per-axis residual stats from model's Q diagonal
+        # Per-axis residual stats from model's Q diagonal (global fallback)
         Q = model.Q.to(device)
         self.sigma = torch.sqrt(Q.diag()).clamp(min=1e-8)  # (d,)
         self.mu = torch.zeros(self.d, device=device)        # residual mean (estimated offline)
@@ -127,9 +139,16 @@ class DegradationDetector:
         v_hat = self.model.predict(v_prev.unsqueeze(0), u_prev.unsqueeze(0)).squeeze(0)
         r = v_next - v_hat
 
-        # Standardized residual per axis (subtract mean)
-        z = torch.abs(r - self.mu) / self.sigma     # (d,)
-        A_t = z.max().item()                          # max-z score
+        # Standardized residual per axis
+        if self.residual_model is not None:
+            # Input-dependent: mu(x), sigma(x) from residual model
+            x_t = torch.cat([v_prev, u_prev], dim=-1)  # (6,)
+            mu_local, sigma_local = self.residual_model.predict(x_t)
+            z = torch.abs(r - mu_local) / sigma_local   # (d,)
+        else:
+            # Global fallback
+            z = torch.abs(r - self.mu) / self.sigma      # (d,)
+        A_t = z.max().item()                              # max-z score
 
         # Binary anomaly flag
         a_t = 1 if A_t > self.tau_point else 0
@@ -188,12 +207,25 @@ class DegradationDetector:
         self.mu = residuals.mean(dim=0)                           # (d,)
         self.sigma = residuals.std(dim=0).clamp(min=1e-8)         # (d,)
 
+        # --- Step 1b: Fit residual model if provided ---
+        if self.residual_model is not None:
+            x_all = torch.cat([v_prev, u_prev], dim=-1)  # (N, 6)
+            rm_stats = self.residual_model.fit(x_all, residuals)
+            print(f"\n[ResidualModel] Fitting complete:")
+            for k, v in rm_stats.items():
+                print(f"  {k}: {v}")
+
         # --- Step 2: Theoretical tau_point ---
         tau_theory = compute_tau_theoretical(alpha, d=self.d)
         self.tau_point = tau_theory
 
         # --- Step 3: Empirical validation ---
-        z_all = torch.abs(residuals - self.mu.unsqueeze(0)) / self.sigma.unsqueeze(0)
+        if self.residual_model is not None:
+            x_all = torch.cat([v_prev, u_prev], dim=-1)
+            mu_local, sigma_local = self.residual_model.predict(x_all)
+            z_all = torch.abs(residuals - mu_local) / sigma_local
+        else:
+            z_all = torch.abs(residuals - self.mu.unsqueeze(0)) / self.sigma.unsqueeze(0)
         A_all = z_all.max(dim=-1).values  # (N,)
 
         a_all = (A_all > self.tau_point).long()
@@ -249,18 +281,23 @@ class DegradationDetector:
         self._buf_ptr = 0
         self._buf_filled = 0
 
-    def save(self, path: str):
-        torch.save({
+    def save(self, path: str, residual_model_path: Optional[str] = None):
+        save_dict = {
             "tau_point": float(self.tau_point),
             "alpha": float(self.alpha),
             "C_levels": [int(c) for c in self.C_levels],
             "mu": self.mu.cpu(),
             "sigma": self.sigma.cpu(),
             "W": int(self.W),
-        }, path)
+            "has_residual_model": self.residual_model is not None,
+        }
+        torch.save(save_dict, path)
+        # Save residual model separately
+        if self.residual_model is not None and residual_model_path is not None:
+            self.residual_model.save(residual_model_path)
 
-    def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+    def load(self, path: str, residual_model_path: Optional[str] = None):
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.tau_point = float(ckpt["tau_point"])
         self.alpha = float(ckpt.get("alpha", 1e-3))
         self.C_levels = [int(c) for c in ckpt["C_levels"]]
@@ -271,6 +308,10 @@ class DegradationDetector:
         self.W = int(ckpt["W"])
         self._flag_buf = torch.zeros(self.W, dtype=torch.long, device=self.device)
         self._score_buf = torch.zeros(self.W, device=self.device)
+        # Load residual model if saved and path provided
+        if ckpt.get("has_residual_model", False) and residual_model_path is not None:
+            if self.residual_model is not None:
+                self.residual_model.load(residual_model_path)
 
 
 class BatchDegradationDetector:
@@ -280,12 +321,14 @@ class BatchDegradationDetector:
     Maintains per-environment ring buffers of binary anomaly flags.
     """
 
-    def __init__(self, model, num_envs: int, window_size: int = 20, device: str = "cpu"):
+    def __init__(self, model, num_envs: int, window_size: int = 20, device: str = "cpu",
+                 residual_model=None):
         self.model = model
         self.num_envs = num_envs
         self.W = window_size
         self.device = device
         self.d = 3
+        self.residual_model = residual_model  # optional input-dependent model
 
         Q = model.Q.to(device)
         self.sigma = torch.sqrt(Q.diag()).clamp(min=1e-8)  # (d,)
@@ -316,9 +359,14 @@ class BatchDegradationDetector:
         v_hat = self.model.predict(v_prev, u_prev)
         r = v_next - v_hat
 
-        # Per-axis standardized residual (subtract mean)
-        z = torch.abs(r - self.mu.unsqueeze(0)) / self.sigma.unsqueeze(0)  # (num_envs, d)
-        A_t = z.max(dim=-1).values                                          # (num_envs,)
+        # Per-axis standardized residual
+        if self.residual_model is not None:
+            x_t = torch.cat([v_prev, u_prev], dim=-1)  # (num_envs, 6)
+            mu_local, sigma_local = self.residual_model.predict(x_t)
+            z = torch.abs(r - mu_local) / sigma_local   # (num_envs, d)
+        else:
+            z = torch.abs(r - self.mu.unsqueeze(0)) / self.sigma.unsqueeze(0)  # (num_envs, d)
+        A_t = z.max(dim=-1).values                                              # (num_envs,)
 
         # Binary anomaly flags
         a_t = (A_t > self.tau_point).long()                  # (num_envs,)
@@ -355,10 +403,13 @@ class BatchDegradationDetector:
 
     def set_thresholds(self, tau_point: float, C_levels: list,
                        mu: Optional[torch.Tensor] = None,
-                       sigma: Optional[torch.Tensor] = None):
+                       sigma: Optional[torch.Tensor] = None,
+                       residual_model=None):
         self.tau_point = tau_point
         self.C_levels = C_levels
         if mu is not None:
             self.mu = mu.to(self.device)
         if sigma is not None:
             self.sigma = sigma.to(self.device)
+        if residual_model is not None:
+            self.residual_model = residual_model

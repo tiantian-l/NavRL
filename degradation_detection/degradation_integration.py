@@ -30,6 +30,7 @@ if _dd_dir not in sys.path:
 
 from transition_models import LinearTransitionModel, MLPTransitionModel
 from degradation_detector import BatchDegradationDetector
+from residual_model import HeteroscedasticMLP
 
 
 def init_degradation_detector(env, model_dir: str = None, model_type: str = "both",
@@ -88,16 +89,33 @@ def init_degradation_detector(env, model_dir: str = None, model_type: str = "bot
         if os.path.exists(mlp_path):
             mlp_model = MLPTransitionModel(device=env.device)
             mlp_model.load(mlp_path)
-            det = BatchDegradationDetector(mlp_model, env.num_envs, window_size, env.device)
-            det_path = os.path.join(model_dir, "mlp_detector.pt")
+
+            # Check for residual model (input-dependent sigma)
+            res_model = None
+            rm_model_path = os.path.join(model_dir, "residual_model.pt")
+            rm_det_path = os.path.join(model_dir, "mlp_detector_rm.pt")
+            if os.path.exists(rm_model_path):
+                res_model = HeteroscedasticMLP(input_dim=6, output_dim=3, device=str(env.device))
+                res_model.load(rm_model_path)
+                print(f"[DegDetector] Loaded residual model from {rm_model_path}")
+
+            det = BatchDegradationDetector(
+                mlp_model, env.num_envs, window_size, env.device,
+                residual_model=res_model,
+            )
+            # Use residual-model detector checkpoint if available
+            det_path = rm_det_path if res_model and os.path.exists(rm_det_path) else \
+                       os.path.join(model_dir, "mlp_detector.pt")
             if os.path.exists(det_path):
-                ckpt = torch.load(det_path, map_location=env.device, weights_only=True)
+                ckpt = torch.load(det_path, map_location=env.device, weights_only=False)
                 det.set_thresholds(
                     tau_point=float(ckpt["tau_point"]),
                     C_levels=[int(c) for c in ckpt["C_levels"]],
+                    residual_model=res_model,
                 )
             env._deg_detectors["mlp"] = det
-            print(f"[DegDetector] MLP: tau={det.tau_point:.4f}, C_levels={det.C_levels}")
+            rm_str = "+ ResidualModel" if res_model else ""
+            print(f"[DegDetector] MLP {rm_str}: tau={det.tau_point:.4f}, C_levels={det.C_levels}")
 
 
 def update_degradation_scores(env):

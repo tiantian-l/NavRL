@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from transition_models import LinearTransitionModel, MLPTransitionModel
 from degradation_detector import DegradationDetector
+from residual_model import HeteroscedasticMLP
 
 
 def _print_threshold_stats(label: str, s: dict):
@@ -40,7 +41,8 @@ def _print_threshold_stats(label: str, s: dict):
 
 def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
                  mlp_epochs: int = 1000, mlp_hidden: int = 32, window_size: int = 20,
-                 alpha: float = 1e-3):
+                 alpha: float = 1e-3, residual_model_type: str = "none",
+                 residual_hidden: int = 64, residual_epochs: int = 500):
     """
     Load nominal data, fit both models, compute thresholds, save everything.
 
@@ -52,6 +54,9 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
         mlp_hidden: MLP hidden layer width
         window_size: W for degradation detector sliding window
         alpha: single-step false-positive rate for theoretical threshold
+        residual_model_type: 'none', 'hetero_mlp', or 'sparse_gp'
+        residual_hidden: hidden dim for heteroscedastic MLP
+        residual_epochs: training epochs for residual model
     """
     os.makedirs(output_dir, exist_ok=True)
     print(f"Loading nominal data from {data_path} ...")
@@ -155,10 +160,46 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
         val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
         ep_lengths=val_ep_lengths, alpha=alpha,
     )
-    _print_threshold_stats("MLP", mlp_stats)
+    _print_threshold_stats("MLP (global sigma)", mlp_stats)
 
     mlp_det_path = os.path.join(output_dir, "mlp_detector.pt")
     mlp_detector.save(mlp_det_path)
+
+    # ========== 3. Residual Model (input-dependent sigma) ==========
+    res_model = None
+    res_stats = None
+    if residual_model_type != "none":
+        print(f"\n===== Fitting Residual Model ({residual_model_type}) =====")
+
+        if residual_model_type == "hetero_mlp":
+            res_model = HeteroscedasticMLP(
+                input_dim=6, output_dim=3, hidden_dim=residual_hidden, device=device
+            )
+        elif residual_model_type == "sparse_gp":
+            from residual_model import SparseGPResidualModel
+            res_model = SparseGPResidualModel(
+                input_dim=6, output_dim=3, num_inducing=500, device=device
+            )
+        else:
+            raise ValueError(f"Unknown residual_model_type: {residual_model_type}")
+
+        # Fit detector with residual model (fits model inside compute_thresholds)
+        mlp_detector_rm = DegradationDetector(
+            mlp_model, window_size=window_size, device=device,
+            residual_model=res_model,
+        )
+        res_stats = mlp_detector_rm.compute_thresholds(
+            val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
+            ep_lengths=val_ep_lengths, alpha=alpha,
+        )
+        _print_threshold_stats(f"MLP + {residual_model_type}", res_stats)
+
+        # Save detector and residual model
+        rm_det_path = os.path.join(output_dir, "mlp_detector_rm.pt")
+        rm_model_path = os.path.join(output_dir, "residual_model.pt")
+        mlp_detector_rm.save(rm_det_path, residual_model_path=rm_model_path)
+        print(f"  Residual model saved to {rm_model_path}")
+        print(f"  Detector (with RM) saved to {rm_det_path}")
 
     # ========== Summary ==========
     print("\n===== Comparison Summary =====")
@@ -173,10 +214,21 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     mlp_cl = mlp_stats['C_levels']
     print(f"  {'C_levels':<25} {str(linear_cl):>12} {str(mlp_cl):>12}")
 
+    if res_stats is not None:
+        print(f"\n  --- With {residual_model_type} residual model ---")
+        print(f"  {'p_actual (RM)':<25} {res_stats['p_actual']:>12.6f}")
+        print(f"  {'p_ratio (RM)':<25} {res_stats['p_ratio']:>12.2f}")
+        print(f"  {'A_t q99 (RM)':<25} {res_stats['A_q99']:>12.4f}")
+        print(f"  {'C_levels (RM)':<25} {str(res_stats['C_levels']):>12}")
+        if 'C_mean' in res_stats:
+            print(f"  {'C_mean/std (RM)':<25} {res_stats['C_mean']:>6.4f} / {res_stats['C_std']:>6.4f}")
+
     print(f"\nAll models saved to {output_dir}/")
     return {
         "linear": {"model": linear_model, "stats": linear_stats, "val_mse": val_mse},
         "mlp": {"model": mlp_model, "stats": mlp_stats, "val_mse": val_mse_mlp},
+        "residual_model": res_model,
+        "residual_stats": res_stats,
     }
 
 
@@ -298,6 +350,13 @@ if __name__ == "__main__":
                         help="Sliding window W for degradation score")
     parser.add_argument("--alpha", type=float, default=1e-3,
                         help="Single-step false-positive rate (default: 1e-3, tau≈3.4)")
+    parser.add_argument("--residual_model", type=str, default="none",
+                        choices=["none", "hetero_mlp", "sparse_gp"],
+                        help="Type of input-dependent residual model (default: none)")
+    parser.add_argument("--residual_hidden", type=int, default=64,
+                        help="Hidden dim for hetero_mlp residual model")
+    parser.add_argument("--residual_epochs", type=int, default=500,
+                        help="Training epochs for residual model")
 
     args = parser.parse_args()
     fit_and_save(
@@ -308,4 +367,7 @@ if __name__ == "__main__":
         mlp_hidden=args.mlp_hidden,
         window_size=args.window_size,
         alpha=args.alpha,
+        residual_model_type=args.residual_model,
+        residual_hidden=args.residual_hidden,
+        residual_epochs=args.residual_epochs,
     )
