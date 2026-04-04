@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 from transition_models import LinearTransitionModel, MLPTransitionModel
+from quadrotor_dynamics import QuadrotorODETransitionModel
 from degradation_detector import DegradationDetector
 from residual_model import HeteroscedasticMLP
 
@@ -165,7 +166,47 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     mlp_det_path = os.path.join(output_dir, "mlp_detector.pt")
     mlp_detector.save(mlp_det_path)
 
-    # ========== 3. Residual Model (input-dependent sigma) ==========
+    # ========== 3. Physics-Based ODE Model ==========
+    print(f"\n===== Fitting Quadrotor ODE Transition Model (dt={1/62.5:.4f}) =====")
+    ode_model = QuadrotorODETransitionModel(
+        state_dim=3, input_dim=3, dt=1/62.5,
+        mass=0.716, gravity=9.81,
+        K_v=[2.2, 2.2, 2.2],
+        tau_att=0.05, tau_thrust=0.03,
+        drag=[0.1, 0.1, 0.1],
+        num_substeps=4, device=device,
+    )
+    ode_result = ode_model.fit(
+        v_prev[train_idx], u_prev[train_idx], v_next[train_idx],
+        lr=5e-3, epochs=500, batch_size=4096, verbose=True,
+    )
+    print(f"  Q diag = {ode_result['Q'].diag().cpu().numpy()}")
+
+    # Validation MSE
+    with torch.no_grad():
+        val_pred_ode = ode_model.predict(val_v_prev.to(device), val_u_prev.to(device))
+        val_mse_ode = ((val_pred_ode - val_v_next.to(device)) ** 2).mean().item()
+    print(f"  Validation MSE = {val_mse_ode:.6f}")
+    print(f"  Improvement over linear: {(1 - val_mse_ode / val_mse) * 100:.1f}%")
+    print(f"  Improvement over MLP:    {(1 - val_mse_ode / val_mse_mlp) * 100:.1f}%")
+
+    ode_path = os.path.join(output_dir, "ode_model.pt")
+    ode_model.save(ode_path)
+    print(f"  Saved to {ode_path}")
+
+    # Thresholds
+    print("  Computing thresholds ...")
+    ode_detector = DegradationDetector(ode_model, window_size=window_size, device=device)
+    ode_stats = ode_detector.compute_thresholds(
+        val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
+        ep_lengths=val_ep_lengths, alpha=alpha,
+    )
+    _print_threshold_stats("ODE (physics-based)", ode_stats)
+
+    ode_det_path = os.path.join(output_dir, "ode_detector.pt")
+    ode_detector.save(ode_det_path)
+
+    # ========== 4. Residual Model (input-dependent sigma) ==========
     res_model = None
     res_stats = None
     if residual_model_type != "none":
@@ -179,6 +220,11 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
             from residual_model import SparseGPResidualModel
             res_model = SparseGPResidualModel(
                 input_dim=6, output_dim=3, num_inducing=500, device=device
+            )
+        elif residual_model_type == "exact_gp":
+            from residual_model import ExactGPResidualModel
+            res_model = ExactGPResidualModel(
+                input_dim=6, max_train_size=3000, device=device
             )
         else:
             raise ValueError(f"Unknown residual_model_type: {residual_model_type}")
@@ -194,6 +240,10 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
         )
         _print_threshold_stats(f"MLP + {residual_model_type}", res_stats)
 
+        # Print GP diagnostics if applicable
+        if hasattr(res_model, 'print_diagnostics'):
+            res_model.print_diagnostics()
+
         # Save detector and residual model
         rm_det_path = os.path.join(output_dir, "mlp_detector_rm.pt")
         rm_model_path = os.path.join(output_dir, "residual_model.pt")
@@ -203,16 +253,21 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
 
     # ========== Summary ==========
     print("\n===== Comparison Summary =====")
-    print(f"  {'Metric':<25} {'Linear':>12} {'MLP':>12}")
-    print(f"  {'Val MSE':<25} {val_mse:>12.6f} {val_mse_mlp:>12.6f}")
-    print(f"  {'Q trace':<25} {result['Q'].trace().item():>12.6f} {mlp_result['Q'].trace().item():>12.6f}")
-    print(f"  {'tau (theory)':<25} {linear_stats['tau_theory']:>12.4f} {mlp_stats['tau_theory']:>12.4f}")
-    print(f"  {'p_actual':<25} {linear_stats['p_actual']:>12.6f} {mlp_stats['p_actual']:>12.6f}")
-    print(f"  {'p_ratio (actual/alpha)':<25} {linear_stats['p_ratio']:>12.2f} {mlp_stats['p_ratio']:>12.2f}")
-    print(f"  {'A_t q99 (empirical)':<25} {linear_stats['A_q99']:>12.4f} {mlp_stats['A_q99']:>12.4f}")
+    print(f"  {'Metric':<25} {'Linear':>12} {'MLP':>12} {'ODE':>12}")
+    print(f"  {'Val MSE':<25} {val_mse:>12.6f} {val_mse_mlp:>12.6f} {val_mse_ode:>12.6f}")
+    print(f"  {'Q trace':<25} {result['Q'].trace().item():>12.6f} {mlp_result['Q'].trace().item():>12.6f} {ode_result['Q'].trace().item():>12.6f}")
+    print(f"  {'tau (theory)':<25} {linear_stats['tau_theory']:>12.4f} {mlp_stats['tau_theory']:>12.4f} {ode_stats['tau_theory']:>12.4f}")
+    print(f"  {'p_actual':<25} {linear_stats['p_actual']:>12.6f} {mlp_stats['p_actual']:>12.6f} {ode_stats['p_actual']:>12.6f}")
+    print(f"  {'p_ratio (actual/alpha)':<25} {linear_stats['p_ratio']:>12.2f} {mlp_stats['p_ratio']:>12.2f} {ode_stats['p_ratio']:>12.2f}")
+    print(f"  {'A_t q99 (empirical)':<25} {linear_stats['A_q99']:>12.4f} {mlp_stats['A_q99']:>12.4f} {ode_stats['A_q99']:>12.4f}")
     linear_cl = linear_stats['C_levels']
     mlp_cl = mlp_stats['C_levels']
-    print(f"  {'C_levels':<25} {str(linear_cl):>12} {str(mlp_cl):>12}")
+    ode_cl = ode_stats['C_levels']
+    print(f"  {'C_levels':<25} {str(linear_cl):>12} {str(mlp_cl):>12} {str(ode_cl):>12}")
+
+    # Print fitted physical parameters
+    print(f"\n  --- ODE Model Physical Parameters ---")
+    ode_model._print_params()
 
     if res_stats is not None:
         print(f"\n  --- With {residual_model_type} residual model ---")
@@ -227,6 +282,7 @@ def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
     return {
         "linear": {"model": linear_model, "stats": linear_stats, "val_mse": val_mse},
         "mlp": {"model": mlp_model, "stats": mlp_stats, "val_mse": val_mse_mlp},
+        "ode": {"model": ode_model, "stats": ode_stats, "val_mse": val_mse_ode},
         "residual_model": res_model,
         "residual_stats": res_stats,
     }
@@ -351,7 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=1e-3,
                         help="Single-step false-positive rate (default: 1e-3, tau≈3.4)")
     parser.add_argument("--residual_model", type=str, default="none",
-                        choices=["none", "hetero_mlp", "sparse_gp"],
+                        choices=["none", "hetero_mlp", "sparse_gp", "exact_gp"],
                         help="Type of input-dependent residual model (default: none)")
     parser.add_argument("--residual_hidden", type=int, default=64,
                         help="Hidden dim for hetero_mlp residual model")

@@ -393,3 +393,409 @@ class SparseGPResidualModel:
 
             self.models.append(model)
             self.likelihoods.append(likelihood)
+
+    def get_diagnostics(self) -> dict:
+        """
+        Extract diagnostic info from trained Sparse GP models.
+
+        Returns dict with per-axis kernel hyperparameters, noise, and
+        input relevance — allows checking if training was adequate.
+        """
+        if self.models is None:
+            return {"error": "Models not trained yet"}
+
+        diagnostics = {}
+        axis_labels = ["vx", "vy", "vz"]
+        input_names = ["v_x", "v_y", "v_z", "u_x", "u_y", "u_z"]
+
+        for i in range(self.output_dim):
+            model = self.models[i]
+            likelihood = self.likelihoods[i]
+
+            ls = model.covar_module.base_kernel.lengthscale.detach().cpu().squeeze()
+            os_val = model.covar_module.outputscale.item()
+            noise = likelihood.noise.item()
+
+            relevance = 1.0 / ls.numpy()
+            relevance_norm = relevance / relevance.sum()
+
+            diagnostics[axis_labels[i]] = {
+                "lengthscales": ls.numpy().tolist(),
+                "outputscale": os_val,
+                "noise": noise,
+                "signal_to_noise": os_val / max(noise, 1e-10),
+                "input_relevance": {
+                    name: f"{rel:.1%}" for name, rel in zip(input_names, relevance_norm)
+                },
+                "num_inducing": model.variational_strategy.inducing_points.shape[0],
+            }
+
+        return diagnostics
+
+    def print_diagnostics(self):
+        """Pretty-print Sparse GP diagnostic information."""
+        diag = self.get_diagnostics()
+        if "error" in diag:
+            print(f"  {diag['error']}")
+            return
+
+        print("\n  ========== Sparse GP Diagnostics ==========")
+        for axis_name, d in diag.items():
+            print(f"\n  --- {axis_name} ---")
+            print(f"  Kernel: outputscale={d['outputscale']:.6f}  "
+                  f"noise={d['noise']:.6f}  "
+                  f"SNR={d['signal_to_noise']:.1f}")
+            print(f"  Lengthscales: {['%.3f' % l for l in d['lengthscales']]}")
+            print(f"  Input relevance: {d['input_relevance']}")
+            print(f"  Inducing points: {d['num_inducing']}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  3. Exact (Full) GP for v_x, v_y  (optional, requires gpytorch)
+# ──────────────────────────────────────────────────────────────
+
+class ExactGPResidualModel:
+    """
+    Exact (Full) GP for residual modeling of v_x and v_y.
+
+    Unlike Sparse GP, Full GP uses the exact posterior — no variational
+    approximation, no inducing points.  The trade-off is O(N^3) cost, so
+    we subsample the training data to a manageable size (default: 3000).
+
+    Two independent single-output GPs:
+      GP_vx: input = [v_{t-1}, u_{t-1}] (6D) -> residual r_x (scalar)
+      GP_vy: input = [v_{t-1}, u_{t-1}] (6D) -> residual r_y (scalar)
+
+    Kernel: ScaleKernel(RBF(ARD)) — auto learns per-dimension lengthscales.
+
+    Built-in diagnostics:
+      - NLPD (Negative Log Predictive Density) on held-out data
+      - Learned kernel hyperparameters (lengthscales, outputscale, noise)
+      - Standardized residual calibration check
+      - Input relevance ranking from ARD lengthscales
+
+    For v_z: falls back to global sigma (least variable axis).
+
+    Reference:
+      Rasmussen & Williams, "Gaussian Processes for Machine Learning",
+      MIT Press 2006.
+    """
+
+    def __init__(self, input_dim: int = 6, max_train_size: int = 3000,
+                 device: str = "cpu"):
+        if not _check_gpytorch():
+            raise ImportError("gpytorch required. Install: pip install gpytorch")
+
+        self.input_dim = input_dim
+        self.output_dim = 3  # interface compatibility (predict returns 3D)
+        self.max_train_size = max_train_size
+        self.device = device
+        self.axis_names = ["vx", "vy"]
+        self.num_gp_axes = 2  # only vx, vy get GPs
+
+        self.models = None
+        self.likelihoods = None
+        self.train_x = None
+        self.train_y = None  # list of (N,) per axis
+
+        # Global fallback sigma for vz (axis 2)
+        self.vz_mu = 0.0
+        self.vz_sigma = 1.0
+
+    def _create_exact_gp(self, train_x, train_y):
+        """Create a single-axis ExactGP model class."""
+        import gpytorch
+
+        class _ExactGP(gpytorch.models.ExactGP):
+            def __init__(self, train_x, train_y, likelihood):
+                super().__init__(train_x, train_y, likelihood)
+                self.mean_module = gpytorch.means.ConstantMean()
+                self.covar_module = gpytorch.kernels.ScaleKernel(
+                    gpytorch.kernels.RBFKernel(ard_num_dims=train_x.size(-1))
+                )
+
+            def forward(self, x):
+                mean = self.mean_module(x)
+                covar = self.covar_module(x)
+                return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+        return _ExactGP
+
+    def fit(self, x: torch.Tensor, r: torch.Tensor,
+            lr: float = 0.1, epochs: int = 100,
+            verbose: bool = True):
+        """
+        Train 2 independent ExactGPs (vx, vy) on residuals.
+
+        Args:
+            x: (N, 6) inputs [v_{t-1}, u_{t-1}]
+            r: (N, 3) residuals per axis
+        Returns:
+            dict with diagnostics per axis
+        """
+        import gpytorch
+
+        x = x.float().to(self.device)
+        r = r.float().to(self.device)
+        N = x.shape[0]
+
+        # --- Subsample if needed ---
+        if N > self.max_train_size:
+            perm = torch.randperm(N)[:self.max_train_size]
+            mask = _mask_from_indices(N, perm, self.device)
+            x_train = x[perm]
+            r_train = r[perm]
+            x_val = x[~mask]
+            r_val = r[~mask]
+            print(f"  [ExactGP] Subsampled {self.max_train_size}/{N} for training, "
+                  f"{N - self.max_train_size} for validation")
+        else:
+            x_train = x
+            r_train = r
+            x_val = None
+            r_val = None
+
+        self.train_x = x_train
+        self.train_y = []
+        self.models = []
+        self.likelihoods = []
+
+        # vz global fallback
+        self.vz_mu = r[:, 2].mean().item()
+        self.vz_sigma = r[:, 2].std().clamp(min=1e-8).item()
+
+        diagnostics = {}
+
+        for axis_idx, axis_name in enumerate(self.axis_names):
+            print(f"\n  [ExactGP] Fitting axis {axis_idx} ({axis_name}) "
+                  f"with {x_train.shape[0]} points ...")
+
+            y_train = r_train[:, axis_idx]
+            self.train_y.append(y_train)
+
+            likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=gpytorch.constraints.GreaterThan(1e-8)
+            ).to(self.device)
+            model_cls = self._create_exact_gp(x_train, y_train)
+            model = model_cls(x_train, y_train, likelihood).to(self.device)
+
+            model.train()
+            likelihood.train()
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+            losses = []
+            for epoch in range(epochs):
+                optimizer.zero_grad()
+                output = model(x_train)
+                loss = -mll(output, y_train)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.item())
+
+                if verbose and (epoch + 1) % 20 == 0:
+                    print(f"    epoch {epoch+1}/{epochs}  -MLL={loss.item():.4f}")
+
+            model.eval()
+            likelihood.eval()
+            self.models.append(model)
+            self.likelihoods.append(likelihood)
+
+            # ---- Diagnostics ----
+            diag = self._compute_diagnostics(
+                model, likelihood, x_train, y_train, x_val,
+                r_val[:, axis_idx] if r_val is not None else None,
+                axis_name, losses
+            )
+            diagnostics[axis_name] = diag
+
+        if verbose:
+            self._print_diagnostics(diagnostics)
+
+        return diagnostics
+
+    def _compute_diagnostics(self, model, likelihood, x_train, y_train,
+                             x_val, y_val, axis_name, losses):
+        """Compute per-axis GP quality diagnostics."""
+        import gpytorch
+
+        diag = {"final_mll": -losses[-1], "converged": True}
+
+        # Check convergence
+        if len(losses) > 20:
+            early_loss = np.mean(losses[:10])
+            late_loss = np.mean(losses[-10:])
+            diag["loss_reduction"] = early_loss - late_loss
+            diag["converged"] = late_loss < early_loss
+
+        # Kernel hyperparameters
+        ls = model.covar_module.base_kernel.lengthscale.detach().cpu().squeeze()
+        diag["lengthscales"] = ls.numpy().tolist()
+        diag["outputscale"] = model.covar_module.outputscale.item()
+        diag["noise"] = likelihood.noise.item()
+        diag["signal_to_noise"] = diag["outputscale"] / max(diag["noise"], 1e-10)
+
+        # Input relevance ranking (shorter lengthscale = more relevant)
+        input_names = ["v_x", "v_y", "v_z", "u_x", "u_y", "u_z"]
+        relevance = 1.0 / ls.numpy()
+        relevance_norm = relevance / relevance.sum()
+        diag["input_relevance"] = {
+            name: f"{rel:.1%}" for name, rel in zip(input_names, relevance_norm)
+        }
+
+        # Training NLPD
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            train_pred = likelihood(model(x_train))
+            train_nlpd = -train_pred.log_prob(y_train) / len(y_train)
+            diag["train_nlpd"] = train_nlpd.item()
+
+            # Standardized residuals on training set
+            train_z = (y_train - train_pred.mean) / train_pred.stddev.clamp(min=1e-8)
+            diag["train_z_mean"] = train_z.mean().item()
+            diag["train_z_std"] = train_z.std().item()
+
+        # Validation NLPD (if available)
+        if x_val is not None and y_val is not None and len(y_val) > 0:
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                val_pred = likelihood(model(x_val))
+                val_nlpd = -val_pred.log_prob(y_val) / len(y_val)
+                diag["val_nlpd"] = val_nlpd.item()
+
+                val_z = (y_val - val_pred.mean) / val_pred.stddev.clamp(min=1e-8)
+                diag["val_z_mean"] = val_z.mean().item()
+                diag["val_z_std"] = val_z.std().item()
+
+                # Coverage: fraction of val points within 2-sigma
+                in_2sigma = (val_z.abs() < 2.0).float().mean().item()
+                diag["val_coverage_2sigma"] = in_2sigma  # should be ~0.954
+
+        return diag
+
+    def _print_diagnostics(self, diagnostics):
+        """Pretty-print GP diagnostics."""
+        print("\n  ========== ExactGP Diagnostics ==========")
+        for axis_name, d in diagnostics.items():
+            print(f"\n  --- {axis_name} ---")
+            print(f"  Final MLL: {d['final_mll']:.4f}  "
+                  f"Converged: {d['converged']}")
+            print(f"  Kernel: outputscale={d['outputscale']:.6f}  "
+                  f"noise={d['noise']:.6f}  "
+                  f"SNR={d['signal_to_noise']:.1f}")
+            print(f"  Lengthscales: {['%.3f' % l for l in d['lengthscales']]}")
+            print(f"  Input relevance: {d['input_relevance']}")
+            print(f"  Train: NLPD={d['train_nlpd']:.4f}  "
+                  f"z_mean={d['train_z_mean']:.3f}  "
+                  f"z_std={d['train_z_std']:.3f}")
+            if "val_nlpd" in d:
+                print(f"  Val:   NLPD={d['val_nlpd']:.4f}  "
+                      f"z_mean={d['val_z_mean']:.3f}  "
+                      f"z_std={d['val_z_std']:.3f}  "
+                      f"2sigma-coverage={d['val_coverage_2sigma']:.1%}")
+                # Quality warnings
+                if d["val_z_std"] > 1.5:
+                    print(f"  ⚠ Underconfident: val z_std={d['val_z_std']:.2f} >> 1.0 "
+                          f"(GP predicts too-wide intervals)")
+                elif d["val_z_std"] < 0.7:
+                    print(f"  ⚠ Overconfident: val z_std={d['val_z_std']:.2f} << 1.0 "
+                          f"(GP predicts too-tight intervals)")
+                if d["val_coverage_2sigma"] < 0.90:
+                    print(f"  ⚠ Poor coverage: only {d['val_coverage_2sigma']:.1%} within 2sigma "
+                          f"(expected ~95.4%)")
+
+    def predict(self, x: torch.Tensor):
+        """
+        Predictive mean and std for all 3 axes.
+
+        vx, vy: from ExactGP
+        vz: from global fallback (constant mu, sigma)
+
+        Args:
+            x: (N, 6) or (6,) input features
+        Returns:
+            mu: (N, 3) or (3,) predictive mean
+            sigma: (N, 3) or (3,) predictive std
+        """
+        import gpytorch
+
+        squeeze = (x.dim() == 1)
+        if squeeze:
+            x = x.unsqueeze(0)
+
+        x = x.to(self.device)
+        N = x.shape[0]
+        mu = torch.zeros(N, 3, device=self.device)
+        sigma = torch.ones(N, 3, device=self.device)
+
+        # GP predictions for vx, vy
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            for i in range(self.num_gp_axes):
+                pred = self.likelihoods[i](self.models[i](x))
+                mu[:, i] = pred.mean
+                sigma[:, i] = pred.stddev
+
+        # vz fallback
+        mu[:, 2] = self.vz_mu
+        sigma[:, 2] = self.vz_sigma
+
+        sigma = sigma.clamp(min=1e-6)
+
+        if squeeze:
+            mu = mu.squeeze(0)
+            sigma = sigma.squeeze(0)
+        return mu, sigma
+
+    def save(self, path: str):
+        save_dict = {
+            "input_dim": self.input_dim,
+            "max_train_size": self.max_train_size,
+            "vz_mu": self.vz_mu,
+            "vz_sigma": self.vz_sigma,
+        }
+        for i in range(self.num_gp_axes):
+            save_dict[f"model_{i}"] = self.models[i].state_dict()
+            save_dict[f"likelihood_{i}"] = self.likelihoods[i].state_dict()
+            save_dict[f"train_x_{i}"] = self.train_x.cpu()
+            save_dict[f"train_y_{i}"] = self.train_y[i].cpu()
+        torch.save(save_dict, path)
+
+    def load(self, path: str):
+        import gpytorch
+
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.input_dim = ckpt["input_dim"]
+        self.max_train_size = ckpt["max_train_size"]
+        self.vz_mu = ckpt["vz_mu"]
+        self.vz_sigma = ckpt["vz_sigma"]
+
+        self.models = []
+        self.likelihoods = []
+        self.train_y = []
+
+        for i in range(self.num_gp_axes):
+            train_x = ckpt[f"train_x_{i}"].to(self.device)
+            train_y = ckpt[f"train_y_{i}"].to(self.device)
+            self.train_y.append(train_y)
+
+            if i == 0:
+                self.train_x = train_x
+
+            likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=gpytorch.constraints.GreaterThan(1e-8)
+            ).to(self.device)
+            model_cls = self._create_exact_gp(train_x, train_y)
+            model = model_cls(train_x, train_y, likelihood).to(self.device)
+            model.load_state_dict(ckpt[f"model_{i}"])
+            likelihood.load_state_dict(ckpt[f"likelihood_{i}"])
+            model.eval()
+            likelihood.eval()
+
+            self.models.append(model)
+            self.likelihoods.append(likelihood)
+
+
+def _mask_from_indices(N: int, indices: torch.Tensor, device: str) -> torch.Tensor:
+    """Create a boolean mask of shape (N,) with True at given indices."""
+    mask = torch.zeros(N, dtype=torch.bool, device=device)
+    mask[indices] = True
+    return mask
