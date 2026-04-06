@@ -1,429 +1,431 @@
-"""
-Collect nominal transition data from Isaac Sim training environment,
-then fit both Linear and MLP transition models and compute detection thresholds.
-
-Usage (inside Isaac Sim Python env):
-    python collect_and_fit.py --checkpoint <path_to_policy.pt> --output_dir ./nominal_models
-
-Or standalone fitting from a saved .pt data file:
-    python collect_and_fit.py --data_file nominal_data.pt --output_dir ./nominal_models
-"""
-
 import argparse
 import os
 import sys
 import torch
-import numpy as np
+import gpytorch
 
 # Add parent directory so we can import transition_models
 sys.path.insert(0, os.path.dirname(__file__))
 
-from transition_models import LinearTransitionModel, MLPTransitionModel
-from quadrotor_dynamics import QuadrotorODETransitionModel
-from degradation_detector import DegradationDetector
-from residual_model import HeteroscedasticMLP
+from transition_models import MLPTransitionModel
 
 
-def _print_threshold_stats(label: str, s: dict):
-    """Pretty-print threshold computation results."""
-    print(f"  --- {label} Threshold Report ---")
-    print(f"  mu    = [{s['mu'][0]:.6f}, {s['mu'][1]:.6f}, {s['mu'][2]:.6f}]")
-    print(f"  sigma = [{s['sigma'][0]:.6f}, {s['sigma'][1]:.6f}, {s['sigma'][2]:.6f}]")
-    print(f"  alpha (target)     = {s['alpha']:.1e}")
-    print(f"  tau   (theoretical)= {s['tau_theory']:.4f}")
-    print(f"  p_actual           = {s['p_actual']:.6f}  (ratio to alpha: {s['p_ratio']:.2f}x)")
-    if s['p_ratio'] > 3.0:
-        print(f"  ⚠ Heavy-tail warning: actual FP rate is {s['p_ratio']:.1f}x higher than Gaussian prediction")
-    print(f"  A_t  mean={s['A_mean']:.4f}  std={s['A_std']:.4f}  q99={s['A_q99']:.4f}")
-    print(f"  C_levels (warn/degrade/severe) = {s['C_levels']}")
-    if 'C_mean' in s:
-        print(f"  C_t  mean={s['C_mean']:.4f}  std={s['C_std']:.4f}  ({s['C_num_windows']} windows)")
+# =========================
+# 1. Utilities
+# =========================
+
+def print_split_info(train_idx, val_idx):
+    print(f"Train samples: {len(train_idx)}")
+    print(f"Val   samples: {len(val_idx)}")
 
 
-def fit_and_save(data_path: str, output_dir: str, device: str = "cpu",
-                 mlp_epochs: int = 1000, mlp_hidden: int = 32, window_size: int = 20,
-                 alpha: float = 1e-3, residual_model_type: str = "none",
-                 residual_hidden: int = 64, residual_epochs: int = 500):
+def make_episode_split(ep_lengths, train_ratio=0.9):
+    num_eps = len(ep_lengths)
+    ep_perm = torch.randperm(num_eps)
+    ep_split = max(1, int(train_ratio * num_eps))
+
+    train_ep_ids = ep_perm[:ep_split]
+    val_ep_ids = ep_perm[ep_split:]
+
+    ep_offsets = torch.cat([torch.tensor([0]), ep_lengths.cumsum(0)])
+
+    train_idx = torch.cat([
+        torch.arange(ep_offsets[i], ep_offsets[i] + ep_lengths[i])
+        for i in train_ep_ids
+    ])
+
+    val_idx = torch.cat([
+        torch.arange(ep_offsets[i], ep_offsets[i] + ep_lengths[i])
+        for i in val_ep_ids
+    ])
+
+    return train_idx, val_idx
+
+
+def make_random_split(N, train_ratio=0.9):
+    perm = torch.randperm(N)
+    split = int(train_ratio * N)
+    return perm[:split], perm[split:]
+
+
+def compute_rmse(pred, target):
+    return torch.sqrt(torch.mean((pred - target) ** 2)).item()
+
+
+def _safe_std(x, eps=1e-6):
+    return torch.clamp(x, min=eps)
+
+
+# =========================
+# 2. Exact GP model (single output)
+# =========================
+
+class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super().__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(ard_num_dims=train_x.shape[-1])
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+class FullGPResidualModel2D:
     """
-    Load nominal data, fit both models, compute thresholds, save everything.
-
-    Args:
-        data_path: path to .pt file with keys 'v_prev', 'u_prev', 'v_next'
-        output_dir: directory to save models and thresholds
-        device: torch device
-        mlp_epochs: training epochs for MLP
-        mlp_hidden: MLP hidden layer width
-        window_size: W for degradation detector sliding window
-        alpha: single-step false-positive rate for theoretical threshold
-        residual_model_type: 'none', 'hetero_mlp', or 'sparse_gp'
-        residual_hidden: hidden dim for heteroscedastic MLP
-        residual_epochs: training epochs for residual model
+    训练 2 个独立的 exact GP，分别拟合 residual_x 和 residual_y
+    输入: x = [vx_prev, vy_prev, ux_prev, uy_prev] -> shape (N, 4)
+    输出: residual_xy -> shape (N, 2)
     """
+    def __init__(self, input_dim=4, output_dim=2, device="cpu"):
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.device = device
+
+        self.models = []
+        self.likelihoods = []
+
+    def fit(self, x_train, y_train, training_iter=150, lr=0.1, verbose=True):
+        self.models = []
+        self.likelihoods = []
+
+        x_train = x_train.to(self.device)
+        y_train = y_train.to(self.device)
+
+        for d in range(self.output_dim):
+            if verbose:
+                dim_name = "x" if d == 0 else "y"
+                print(f"\n[GP] Training residual_{dim_name} ...")
+
+            y_d = y_train[:, d]
+
+            likelihood = gpytorch.likelihoods.GaussianLikelihood().to(self.device)
+            model = ExactGPModel(x_train, y_d, likelihood).to(self.device)
+
+            model.train()
+            likelihood.train()
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+            for i in range(training_iter):
+                optimizer.zero_grad()
+                output = model(x_train)
+                loss = -mll(output, y_d)
+                loss.backward()
+                optimizer.step()
+
+                if verbose and ((i + 1) % 25 == 0 or i == 0):
+                    noise = likelihood.noise.item()
+                    lengthscale = model.covar_module.base_kernel.lengthscale.mean().item()
+                    outputscale = model.covar_module.outputscale.item()
+                    print(
+                        f"  iter {i+1:3d}/{training_iter} | "
+                        f"loss={loss.item():.4f} | "
+                        f"noise={noise:.6f} | "
+                        f"ls={lengthscale:.4f} | "
+                        f"os={outputscale:.4f}"
+                    )
+
+            self.models.append(model)
+            self.likelihoods.append(likelihood)
+
+    @torch.no_grad()
+    def predict(self, x_test):
+        """
+        返回:
+            mean: (N, 2)
+            std:  (N, 2)
+        """
+        x_test = x_test.to(self.device)
+
+        means = []
+        stds = []
+
+        for model, likelihood in zip(self.models, self.likelihoods):
+            model.eval()
+            likelihood.eval()
+
+            with gpytorch.settings.fast_pred_var():
+                pred_dist = likelihood(model(x_test))
+                means.append(pred_dist.mean.unsqueeze(-1))
+                stds.append(pred_dist.stddev.unsqueeze(-1))
+
+        mean = torch.cat(means, dim=-1)
+        std = torch.cat(stds, dim=-1)
+        return mean, std
+
+    def save(self, path):
+        payload = {
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "state_dicts": [],
+        }
+        for model, likelihood in zip(self.models, self.likelihoods):
+            payload["state_dicts"].append({
+                "model": model.state_dict(),
+                "likelihood": likelihood.state_dict(),
+            })
+        torch.save(payload, path)
+
+
+# =========================
+# 3. Evaluation
+# =========================
+
+@torch.no_grad()
+def evaluate_mlp_xy(y_true, pred, prefix="MLP XY"):
+    rmse_all = torch.sqrt(torch.mean((pred - y_true) ** 2)).item()
+    rmse_dim = torch.sqrt(torch.mean((pred - y_true) ** 2, dim=0)).cpu().numpy()
+
+    print(f"\n===== {prefix} Evaluation =====")
+    print(f"Overall RMSE: {rmse_all:.6f}")
+    print(f"Per-dim RMSE [vx, vy]: {rmse_dim}")
+
+    return {
+        "rmse_all": rmse_all,
+        "rmse_dim": rmse_dim,
+    }
+
+
+@torch.no_grad()
+def evaluate_probabilistic_regression_xy(y_true, mean, std, prefix="GP Residual XY"):
+    std = _safe_std(std)
+
+    # RMSE
+    rmse_all = torch.sqrt(torch.mean((mean - y_true) ** 2)).item()
+    rmse_dim = torch.sqrt(torch.mean((mean - y_true) ** 2, dim=0)).cpu().numpy()
+
+    # Gaussian NLL
+    var = std ** 2
+    nll = 0.5 * (((y_true - mean) ** 2) / var + torch.log(2 * torch.pi * var))
+    nll_all = nll.mean().item()
+    nll_dim = nll.mean(dim=0).cpu().numpy()
+
+    # Standardized residual
+    z = (y_true - mean) / std
+    z_mean = z.mean(dim=0).cpu().numpy()
+    z_std = z.std(dim=0).cpu().numpy()
+
+    frac_abs_gt_1 = (z.abs() > 1.0).float().mean(dim=0).cpu().numpy()
+    frac_abs_gt_2 = (z.abs() > 2.0).float().mean(dim=0).cpu().numpy()
+    frac_abs_gt_3 = (z.abs() > 3.0).float().mean(dim=0).cpu().numpy()
+
+    # Coverage
+    cover_68 = ((y_true >= mean - 1.0 * std) & (y_true <= mean + 1.0 * std)).float().mean(dim=0).cpu().numpy()
+    cover_95 = ((y_true >= mean - 1.96 * std) & (y_true <= mean + 1.96 * std)).float().mean(dim=0).cpu().numpy()
+    cover_997 = ((y_true >= mean - 3.0 * std) & (y_true <= mean + 3.0 * std)).float().mean(dim=0).cpu().numpy()
+
+    print(f"\n===== {prefix} Evaluation =====")
+    print(f"Overall RMSE: {rmse_all:.6f}")
+    print(f"Overall NLL : {nll_all:.6f}")
+    print(f"Per-dim RMSE [x_res, y_res]: {rmse_dim}")
+    print(f"Per-dim NLL  [x_res, y_res]: {nll_dim}")
+
+    print("\n[Standardized residual z = (y - mu) / sigma]")
+    print(f"z mean [x, y]: {z_mean}")
+    print(f"z std  [x, y]: {z_std}")
+    print(f"P(|z|>1) [x, y]: {frac_abs_gt_1}   (理论约 0.317)")
+    print(f"P(|z|>2) [x, y]: {frac_abs_gt_2}   (理论约 0.0455)")
+    print(f"P(|z|>3) [x, y]: {frac_abs_gt_3}   (理论约 0.0027)")
+
+    print("\n[Calibration / Coverage]")
+    print(f"68% interval coverage  [x, y]: {cover_68}")
+    print(f"95% interval coverage  [x, y]: {cover_95}")
+    print(f"99.7% interval coverage [x, y]: {cover_997}")
+
+    return {
+        "rmse_all": rmse_all,
+        "rmse_dim": rmse_dim,
+        "nll_all": nll_all,
+        "nll_dim": nll_dim,
+        "z_mean": z_mean,
+        "z_std": z_std,
+        "frac_abs_gt_1": frac_abs_gt_1,
+        "frac_abs_gt_2": frac_abs_gt_2,
+        "frac_abs_gt_3": frac_abs_gt_3,
+        "cover_68": cover_68,
+        "cover_95": cover_95,
+        "cover_997": cover_997,
+    }
+
+
+# =========================
+# 4. Main pipeline (XY only)
+# =========================
+
+def fit_mlp_then_full_gp_xy_only(
+    data_path: str,
+    output_dir: str,
+    device: str = "cpu",
+    mlp_epochs: int = 1000,
+    mlp_hidden: int = 32,
+    gp_sample_size: int = 10000,
+    gp_epochs: int = 150,
+    gp_lr: float = 0.1,
+):
     os.makedirs(output_dir, exist_ok=True)
-    print(f"Loading nominal data from {data_path} ...")
+
+    print(f"Loading data from {data_path} ...")
     data = torch.load(data_path, map_location="cpu", weights_only=True)
-    v_prev = data["v_prev"]  # (N, 3)
-    u_prev = data["u_prev"]  # (N, 3)
-    v_next = data["v_next"]  # (N, 3)
-    ep_lengths = data.get("ep_lengths", None)  # (num_episodes,) or None
+
+    # 原始数据还是 (N, 3)，这里只截取前两维 x/y
+    v_prev = data["v_prev"].float()[:, :2]   # (N, 2)
+    u_prev = data["u_prev"].float()[:, :2]   # (N, 2) 只保留 ux, uy
+    v_next = data["v_next"].float()[:, :2]   # (N, 2)
+    ep_lengths = data.get("ep_lengths", None)
+
     N = v_prev.shape[0]
-    print(f"  Loaded {N} transition samples, state_dim={v_prev.shape[1]}")
-    if ep_lengths is not None:
-        print(f"  Episode info: {len(ep_lengths)} episodes, lengths: min={ep_lengths.min().item()}, "
-              f"max={ep_lengths.max().item()}, mean={ep_lengths.float().mean().item():.1f}")
+    print(f"Loaded {N} samples")
+    print("Only using XY dimensions:")
+    print("  v_prev -> [vx, vy]")
+    print("  u_prev -> [ux, uy]")
+    print("  v_next -> [vx_next, vy_next]")
+    print("  z-axis is ignored")
 
-    # --- Train / validation split ---
+    # 1) 90/10 split
     if ep_lengths is not None and len(ep_lengths) > 1:
-        # Split by episode to preserve temporal structure in val set
-        num_eps = len(ep_lengths)
-        ep_perm = torch.randperm(num_eps)
-        ep_split = max(1, int(0.9 * num_eps))
-        train_ep_ids = ep_perm[:ep_split]
-        val_ep_ids = ep_perm[ep_split:]
-
-        # Compute sample indices for each episode
-        ep_offsets = torch.cat([torch.tensor([0]), ep_lengths.cumsum(0)])
-        train_idx = torch.cat([torch.arange(ep_offsets[i], ep_offsets[i] + ep_lengths[i]) for i in train_ep_ids])
-        val_idx = torch.cat([torch.arange(ep_offsets[i], ep_offsets[i] + ep_lengths[i]) for i in val_ep_ids])
-
-        # Val episode lengths (for episode-aware threshold computation)
-        val_ep_lengths = ep_lengths[val_ep_ids]
-        print(f"  Episode split: {len(train_ep_ids)} train eps ({len(train_idx)} samples), "
-              f"{len(val_ep_ids)} val eps ({len(val_idx)} samples)")
+        print("Using episode-aware split (90% train / 10% val)")
+        train_idx, val_idx = make_episode_split(ep_lengths, train_ratio=0.9)
     else:
-        # Fallback: random sample split (no episode info)
-        perm = torch.randperm(N)
-        split = int(0.9 * N)
-        train_idx, val_idx = perm[:split], perm[split:]
-        val_ep_lengths = None
-        print(f"  No episode info — random sample split: {len(train_idx)} train, {len(val_idx)} val")
+        print("No episode info, using random split (90% train / 10% val)")
+        train_idx, val_idx = make_random_split(N, train_ratio=0.9)
 
-    # Build val data in episode order (contiguous per episode) for threshold computation
+    print_split_info(train_idx, val_idx)
+
+    train_v_prev = v_prev[train_idx]
+    train_u_prev = u_prev[train_idx]
+    train_v_next = v_next[train_idx]
+
     val_v_prev = v_prev[val_idx]
     val_u_prev = u_prev[val_idx]
     val_v_next = v_next[val_idx]
 
-    # ========== 1. Linear Model ==========
-    print("\n===== Fitting Linear Transition Model =====")
-    linear_model = LinearTransitionModel(state_dim=3, input_dim=3, device=device)
-    result = linear_model.fit(v_prev[train_idx], u_prev[train_idx], v_next[train_idx])
-
-    print(f"  A =\n{result['A'].numpy()}")
-    print(f"  B =\n{result['B'].numpy()}")
-    print(f"  Q diag = {result['Q'].diag().numpy()}")
-
-    # Validation MSE
-    with torch.no_grad():
-        val_pred = linear_model.predict(val_v_prev.to(device), val_u_prev.to(device))
-        val_mse = ((val_pred - val_v_next.to(device)) ** 2).mean().item()
-    print(f"  Validation MSE = {val_mse:.6f}")
-
-    linear_path = os.path.join(output_dir, "linear_model.pt")
-    linear_model.save(linear_path)
-    print(f"  Saved to {linear_path}")
-
-    # Thresholds
-    print("  Computing thresholds ...")
-    linear_detector = DegradationDetector(linear_model, window_size=window_size, device=device)
-    linear_stats = linear_detector.compute_thresholds(
-        val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
-        ep_lengths=val_ep_lengths, alpha=alpha,
+    # 2) Train MLP on 90%
+    print(f"\n===== Train MLP on 90% training data (XY only) =====")
+    mlp_model = MLPTransitionModel(
+        state_dim=2,
+        input_dim=2,
+        hidden_dim=mlp_hidden,
+        device=device
     )
-    _print_threshold_stats("Linear", linear_stats)
 
-    linear_det_path = os.path.join(output_dir, "linear_detector.pt")
-    linear_detector.save(linear_det_path)
-
-    # ========== 2. MLP Model ==========
-    print(f"\n===== Fitting MLP Transition Model (hidden={mlp_hidden}, epochs={mlp_epochs}) =====")
-    mlp_model = MLPTransitionModel(state_dim=3, input_dim=3, hidden_dim=mlp_hidden, device=device)
-    mlp_result = mlp_model.fit(
-        v_prev[train_idx], u_prev[train_idx], v_next[train_idx],
-        lr=1e-3, epochs=mlp_epochs, batch_size=4096, verbose=True,
+    mlp_model.fit(
+        train_v_prev,
+        train_u_prev,
+        train_v_next,
+        lr=1e-3,
+        epochs=mlp_epochs,
+        batch_size=4096,
+        verbose=True,
     )
-    print(f"  Q diag = {mlp_result['Q'].diag().cpu().numpy()}")
 
-    # Validation MSE
-    with torch.no_grad():
-        val_pred_mlp = mlp_model.predict(val_v_prev.to(device), val_u_prev.to(device))
-        val_mse_mlp = ((val_pred_mlp - val_v_next.to(device)) ** 2).mean().item()
-    print(f"  Validation MSE = {val_mse_mlp:.6f}")
-    print(f"  Improvement over linear: {(1 - val_mse_mlp / val_mse) * 100:.1f}%")
-
-    mlp_path = os.path.join(output_dir, "mlp_model.pt")
+    mlp_path = os.path.join(output_dir, "mlp_model_xy.pt")
     mlp_model.save(mlp_path)
-    print(f"  Saved to {mlp_path}")
+    print(f"Saved MLP to {mlp_path}")
 
-    # Thresholds
-    print("  Computing thresholds ...")
-    mlp_detector = DegradationDetector(mlp_model, window_size=window_size, device=device)
-    mlp_stats = mlp_detector.compute_thresholds(
-        val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
-        ep_lengths=val_ep_lengths, alpha=alpha,
-    )
-    _print_threshold_stats("MLP (global sigma)", mlp_stats)
-
-    mlp_det_path = os.path.join(output_dir, "mlp_detector.pt")
-    mlp_detector.save(mlp_det_path)
-
-    # ========== 3. Physics-Based ODE Model ==========
-    print(f"\n===== Fitting Quadrotor ODE Transition Model (dt={1/62.5:.4f}) =====")
-    ode_model = QuadrotorODETransitionModel(
-        state_dim=3, input_dim=3, dt=1/62.5,
-        mass=0.716, gravity=9.81,
-        K_v=[2.2, 2.2, 2.2],
-        tau_att=0.05, tau_thrust=0.03,
-        drag=[0.1, 0.1, 0.1],
-        num_substeps=4, device=device,
-    )
-    ode_result = ode_model.fit(
-        v_prev[train_idx], u_prev[train_idx], v_next[train_idx],
-        lr=5e-3, epochs=500, batch_size=4096, verbose=True,
-    )
-    print(f"  Q diag = {ode_result['Q'].diag().cpu().numpy()}")
-
-    # Validation MSE
+    # 3) Evaluate MLP on 10%
     with torch.no_grad():
-        val_pred_ode = ode_model.predict(val_v_prev.to(device), val_u_prev.to(device))
-        val_mse_ode = ((val_pred_ode - val_v_next.to(device)) ** 2).mean().item()
-    print(f"  Validation MSE = {val_mse_ode:.6f}")
-    print(f"  Improvement over linear: {(1 - val_mse_ode / val_mse) * 100:.1f}%")
-    print(f"  Improvement over MLP:    {(1 - val_mse_ode / val_mse_mlp) * 100:.1f}%")
+        val_pred_mlp = mlp_model.predict(val_v_prev.to(device), val_u_prev.to(device)).cpu()
 
-    ode_path = os.path.join(output_dir, "ode_model.pt")
-    ode_model.save(ode_path)
-    print(f"  Saved to {ode_path}")
-
-    # Thresholds
-    print("  Computing thresholds ...")
-    ode_detector = DegradationDetector(ode_model, window_size=window_size, device=device)
-    ode_stats = ode_detector.compute_thresholds(
-        val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
-        ep_lengths=val_ep_lengths, alpha=alpha,
+    mlp_metrics = evaluate_mlp_xy(
+        y_true=val_v_next,
+        pred=val_pred_mlp,
+        prefix="MLP Transition Model (XY)"
     )
-    _print_threshold_stats("ODE (physics-based)", ode_stats)
 
-    ode_det_path = os.path.join(output_dir, "ode_detector.pt")
-    ode_detector.save(ode_det_path)
+    # 4) Compute residuals on 90% training set
+    print(f"\n===== Compute residuals on 90% training data (XY only) =====")
+    with torch.no_grad():
+        train_pred_mlp = mlp_model.predict(train_v_prev.to(device), train_u_prev.to(device)).cpu()
+        train_residual = train_v_next - train_pred_mlp   # (N_train, 2)
 
-    # ========== 4. Residual Model (input-dependent sigma) ==========
-    res_model = None
-    res_stats = None
-    if residual_model_type != "none":
-        print(f"\n===== Fitting Residual Model ({residual_model_type}) =====")
+    # GP 输入是 [vx_prev, vy_prev, ux_prev, uy_prev]
+    x_train_full = torch.cat([train_v_prev, train_u_prev], dim=1)  # (N_train, 4)
 
-        if residual_model_type == "hetero_mlp":
-            res_model = HeteroscedasticMLP(
-                input_dim=6, output_dim=3, hidden_dim=residual_hidden, device=device
-            )
-        elif residual_model_type == "sparse_gp":
-            from residual_model import SparseGPResidualModel
-            res_model = SparseGPResidualModel(
-                input_dim=6, output_dim=3, num_inducing=500, device=device
-            )
-        elif residual_model_type == "exact_gp":
-            from residual_model import ExactGPResidualModel
-            res_model = ExactGPResidualModel(
-                input_dim=6, max_train_size=3000, device=device
-            )
-        else:
-            raise ValueError(f"Unknown residual_model_type: {residual_model_type}")
+    n_train = x_train_full.shape[0]
+    gp_sample_size = min(gp_sample_size, n_train)
 
-        # Fit detector with residual model (fits model inside compute_thresholds)
-        mlp_detector_rm = DegradationDetector(
-            mlp_model, window_size=window_size, device=device,
-            residual_model=res_model,
-        )
-        res_stats = mlp_detector_rm.compute_thresholds(
-            val_v_prev.to(device), val_u_prev.to(device), val_v_next.to(device),
-            ep_lengths=val_ep_lengths, alpha=alpha,
-        )
-        _print_threshold_stats(f"MLP + {residual_model_type}", res_stats)
+    sample_idx = torch.randperm(n_train)[:gp_sample_size]
+    x_gp_train = x_train_full[sample_idx]
+    y_gp_train = train_residual[sample_idx]
 
-        # Print GP diagnostics if applicable
-        if hasattr(res_model, 'print_diagnostics'):
-            res_model.print_diagnostics()
+    print(f"Sampled {gp_sample_size} residual points from 90% train set for exact GP")
 
-        # Save detector and residual model
-        rm_det_path = os.path.join(output_dir, "mlp_detector_rm.pt")
-        rm_model_path = os.path.join(output_dir, "residual_model.pt")
-        mlp_detector_rm.save(rm_det_path, residual_model_path=rm_model_path)
-        print(f"  Residual model saved to {rm_model_path}")
-        print(f"  Detector (with RM) saved to {rm_det_path}")
+    # 5) Train exact GP on residuals
+    print(f"\n===== Train Full GP on sampled XY residuals =====")
+    gp_model = FullGPResidualModel2D(input_dim=4, output_dim=2, device=device)
+    gp_model.fit(
+        x_gp_train,
+        y_gp_train,
+        training_iter=gp_epochs,
+        lr=gp_lr,
+        verbose=True,
+    )
 
-    # ========== Summary ==========
-    print("\n===== Comparison Summary =====")
-    print(f"  {'Metric':<25} {'Linear':>12} {'MLP':>12} {'ODE':>12}")
-    print(f"  {'Val MSE':<25} {val_mse:>12.6f} {val_mse_mlp:>12.6f} {val_mse_ode:>12.6f}")
-    print(f"  {'Q trace':<25} {result['Q'].trace().item():>12.6f} {mlp_result['Q'].trace().item():>12.6f} {ode_result['Q'].trace().item():>12.6f}")
-    print(f"  {'tau (theory)':<25} {linear_stats['tau_theory']:>12.4f} {mlp_stats['tau_theory']:>12.4f} {ode_stats['tau_theory']:>12.4f}")
-    print(f"  {'p_actual':<25} {linear_stats['p_actual']:>12.6f} {mlp_stats['p_actual']:>12.6f} {ode_stats['p_actual']:>12.6f}")
-    print(f"  {'p_ratio (actual/alpha)':<25} {linear_stats['p_ratio']:>12.2f} {mlp_stats['p_ratio']:>12.2f} {ode_stats['p_ratio']:>12.2f}")
-    print(f"  {'A_t q99 (empirical)':<25} {linear_stats['A_q99']:>12.4f} {mlp_stats['A_q99']:>12.4f} {ode_stats['A_q99']:>12.4f}")
-    linear_cl = linear_stats['C_levels']
-    mlp_cl = mlp_stats['C_levels']
-    ode_cl = ode_stats['C_levels']
-    print(f"  {'C_levels':<25} {str(linear_cl):>12} {str(mlp_cl):>12} {str(ode_cl):>12}")
+    gp_path = os.path.join(output_dir, "full_gp_residual_xy.pt")
+    gp_model.save(gp_path)
+    print(f"Saved full GP to {gp_path}")
 
-    # Print fitted physical parameters
-    print(f"\n  --- ODE Model Physical Parameters ---")
-    ode_model._print_params()
+    # 6) Evaluate GP on held-out 10%
+    print(f"\n===== Evaluate Full GP on held-out 10% (XY residuals) =====")
+    with torch.no_grad():
+        val_pred_mlp = mlp_model.predict(val_v_prev.to(device), val_u_prev.to(device)).cpu()
+        val_residual_true = val_v_next - val_pred_mlp  # (N_val, 2)
 
-    if res_stats is not None:
-        print(f"\n  --- With {residual_model_type} residual model ---")
-        print(f"  {'p_actual (RM)':<25} {res_stats['p_actual']:>12.6f}")
-        print(f"  {'p_ratio (RM)':<25} {res_stats['p_ratio']:>12.2f}")
-        print(f"  {'A_t q99 (RM)':<25} {res_stats['A_q99']:>12.4f}")
-        print(f"  {'C_levels (RM)':<25} {str(res_stats['C_levels']):>12}")
-        if 'C_mean' in res_stats:
-            print(f"  {'C_mean/std (RM)':<25} {res_stats['C_mean']:>6.4f} / {res_stats['C_std']:>6.4f}")
+        x_val = torch.cat([val_v_prev, val_u_prev], dim=1)  # (N_val, 4)
+        gp_mean, gp_std = gp_model.predict(x_val)
 
-    print(f"\nAll models saved to {output_dir}/")
+        gp_mean = gp_mean.cpu()
+        gp_std = gp_std.cpu()
+
+    gp_metrics = evaluate_probabilistic_regression_xy(
+        y_true=val_residual_true,
+        mean=gp_mean,
+        std=gp_std,
+        prefix="Full GP Residual Model (XY)"
+    )
+
+    print(f"\nAll outputs saved to: {output_dir}")
     return {
-        "linear": {"model": linear_model, "stats": linear_stats, "val_mse": val_mse},
-        "mlp": {"model": mlp_model, "stats": mlp_stats, "val_mse": val_mse_mlp},
-        "ode": {"model": ode_model, "stats": ode_stats, "val_mse": val_mse_ode},
-        "residual_model": res_model,
-        "residual_stats": res_stats,
+        "mlp_model": mlp_model,
+        "mlp_metrics": mlp_metrics,
+        "gp_model": gp_model,
+        "gp_metrics": gp_metrics,
     }
 
 
-def collect_from_env_buffers(env, num_steps: int, output_path: str):
-    """
-    Collect nominal transition data from the Isaac Sim env's existing ring buffers.
-
-    Call this AFTER running the policy for num_steps in the env.
-    Extracts (v_{t-1}, u_{t-1}, v_t) triples from the env's vel_cmd_buf and vel_real_buf.
-
-    Args:
-        env: the NavigationEnv instance (must have _vel_cmd_buf, _vel_real_buf populated)
-        num_steps: how many total steps have been run
-        output_path: where to save the .pt file
-    """
-    vel_cmd = env._vel_cmd_buf.detach().cpu()    # (num_envs, W, 3)
-    vel_real = env._vel_real_buf.detach().cpu()   # (num_envs, W, 3)
-    filled = env._buf_filled.detach().cpu()       # (num_envs,)
-
-    all_v_prev = []
-    all_u_prev = []
-    all_v_next = []
-
-    for i in range(env.num_envs):
-        n = filled[i].item()
-        if n < 2:
-            continue
-        # The ring buffer may wrap; read in order from oldest to newest
-        ptr = env._buf_ptr[i].item()
-        if n < env._uc_window:
-            # Buffer not full yet, data is at indices [0, n)
-            indices = list(range(n))
-        else:
-            # Buffer full, oldest is at ptr, newest at ptr-1
-            indices = [(ptr + j) % env._uc_window for j in range(n)]
-
-        v_real_ordered = vel_real[i][indices]   # (n, 3)
-        v_cmd_ordered = vel_cmd[i][indices]     # (n, 3)
-
-        # Construct transition tuples: (v_{t-1}, u_{t-1}, v_t)
-        all_v_prev.append(v_real_ordered[:-1])
-        all_u_prev.append(v_cmd_ordered[:-1])
-        all_v_next.append(v_real_ordered[1:])
-
-    v_prev = torch.cat(all_v_prev, dim=0)
-    u_prev = torch.cat(all_u_prev, dim=0)
-    v_next = torch.cat(all_v_next, dim=0)
-
-    print(f"Collected {v_prev.shape[0]} transition samples from {env.num_envs} envs")
-    torch.save({"v_prev": v_prev, "u_prev": u_prev, "v_next": v_next}, output_path)
-    print(f"Saved to {output_path}")
-    return v_prev, u_prev, v_next
-
-
-def collect_extended(env, policy, collector, num_frames: int, output_path: str):
-    """
-    Run the policy in the environment for num_frames steps and collect ALL transitions
-    (not limited by ring buffer size).
-
-    Args:
-        env: NavigationEnv (the base unwrapped env)
-        policy: the PPO policy module
-        collector: the SyncDataCollector
-        num_frames: total frames to collect
-        output_path: where to save
-    """
-    all_v_prev = []
-    all_u_prev = []
-    all_v_next = []
-
-    prev_vel = None
-    prev_cmd = None
-    collected = 0
-
-    for i, data in enumerate(collector):
-        # data contains per-step info
-        v_cmd = data.get(("info", "vel_cmd"))  # (num_envs, 1, 3) or (batch, 3)
-        drone_state = data.get(("info", "drone_state"))  # (num_envs, 1, 13)
-
-        if v_cmd is None or drone_state is None:
-            continue
-
-        # Current velocity from drone state (indices 7:10 are linear vel in world frame)
-        v_real = drone_state[..., 7:10].reshape(-1, 3).detach().cpu()
-        v_cmd_flat = v_cmd.reshape(-1, 3).detach().cpu()
-
-        if prev_vel is not None:
-            all_v_prev.append(prev_vel)
-            all_u_prev.append(prev_cmd)
-            all_v_next.append(v_real)
-            collected += v_real.shape[0]
-
-        prev_vel = v_real
-        prev_cmd = v_cmd_flat
-
-        if collected >= num_frames:
-            break
-
-    v_prev = torch.cat(all_v_prev, dim=0)
-    u_prev = torch.cat(all_u_prev, dim=0)
-    v_next = torch.cat(all_v_next, dim=0)
-
-    print(f"Collected {v_prev.shape[0]} transition samples")
-    torch.save({"v_prev": v_prev, "u_prev": u_prev, "v_next": v_next}, output_path)
-    print(f"Saved to {output_path}")
-    return v_prev, u_prev, v_next
-
+# =========================
+# 5. CLI
+# =========================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fit nominal transition models")
+    parser = argparse.ArgumentParser(description="Train MLP and full GP residual model on XY motion only")
     parser.add_argument("--data_file", type=str, required=True,
                         help="Path to nominal_data.pt with keys v_prev, u_prev, v_next")
-    parser.add_argument("--output_dir", type=str, default="./nominal_models",
-                        help="Directory to save fitted models")
+    parser.add_argument("--output_dir", type=str, default="./nominal_models_xy")
     parser.add_argument("--device", type=str, default="cpu")
+
     parser.add_argument("--mlp_epochs", type=int, default=1000)
     parser.add_argument("--mlp_hidden", type=int, default=32)
-    parser.add_argument("--window_size", type=int, default=20,
-                        help="Sliding window W for degradation score")
-    parser.add_argument("--alpha", type=float, default=1e-3,
-                        help="Single-step false-positive rate (default: 1e-3, tau≈3.4)")
-    parser.add_argument("--residual_model", type=str, default="none",
-                        choices=["none", "hetero_mlp", "sparse_gp", "exact_gp"],
-                        help="Type of input-dependent residual model (default: none)")
-    parser.add_argument("--residual_hidden", type=int, default=64,
-                        help="Hidden dim for hetero_mlp residual model")
-    parser.add_argument("--residual_epochs", type=int, default=500,
-                        help="Training epochs for residual model")
+
+    parser.add_argument("--gp_sample_size", type=int, default=10000,
+                        help="Number of residual samples drawn from 90% train set for exact GP")
+    parser.add_argument("--gp_epochs", type=int, default=150)
+    parser.add_argument("--gp_lr", type=float, default=0.1)
 
     args = parser.parse_args()
-    fit_and_save(
+
+    fit_mlp_then_full_gp_xy_only(
         data_path=args.data_file,
         output_dir=args.output_dir,
         device=args.device,
         mlp_epochs=args.mlp_epochs,
         mlp_hidden=args.mlp_hidden,
-        window_size=args.window_size,
-        alpha=args.alpha,
-        residual_model_type=args.residual_model,
-        residual_hidden=args.residual_hidden,
-        residual_epochs=args.residual_epochs,
+        gp_sample_size=args.gp_sample_size,
+        gp_epochs=args.gp_epochs,
+        gp_lr=args.gp_lr,
     )
