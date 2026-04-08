@@ -266,6 +266,7 @@ def evaluate(
         export_path = getattr(cfg, 'nominal_data_path', None)
         print(f"[eval] nominal_data_path = {export_path}")
         if export_path:
+            # ---- Collect policy-rollout transitions (natural distribution) ----
             vel_cmd_all = trajs[("next", "info", "vel_cmd")].cpu()       # (num_envs, T, 1, 3)
             drone_st_all = trajs[("next", "info", "drone_state")].cpu()  # (num_envs, T, 1, 13)
             vel_real_all = drone_st_all[..., 7:10]                       # (num_envs, T, 1, 3)
@@ -286,6 +287,93 @@ def evaluate(
                 all_v_next.append(v_real[1:])
                 ep_lengths.append(ep_len - 1)
                 print(f"[eval] env{ei}: ep_len={ep_len}, collected {ep_len-1} transitions")
+
+            # ---- Collect uniform-command transitions in the same eval env ----
+            uniform_cfg = getattr(cfg, 'uniform_data', None)
+            uniform_steps = int(uniform_cfg.num_steps) if uniform_cfg and hasattr(uniform_cfg, 'num_steps') else 0
+            if uniform_steps > 0:
+                hold_steps = int(getattr(uniform_cfg, 'hold_steps', 20))
+                settle_steps = int(getattr(uniform_cfg, 'settle_steps', 60))
+                action_limit = cfg.algo.actor.action_limit
+                device = cfg.device
+
+                print(f"\n[eval-uniform] Collecting {uniform_steps} uniform transitions "
+                      f"(hold={hold_steps}, settle={settle_steps}, limit={action_limit})")
+
+                # Reset all envs for uniform collection (still in eval mode)
+                base_env = env.base_env if hasattr(env, 'base_env') else env
+                td_u = env.reset()
+
+                # Settle: send zero commands so drone stabilizes after reset
+                zero_cmd = torch.zeros(num_envs, 3, device=device)
+                for _ in range(settle_steps):
+                    td_u.set(("agents", "action"), zero_cmd)
+                    td_u = env.step(td_u)
+                    td_u = td_u["next"].clone()
+
+                u_v_prev, u_u_prev, u_v_next = [], [], []
+                cmd_counter = 0
+                current_cmd = torch.zeros(num_envs, 3, device=device)
+                collected = 0
+
+                while collected < uniform_steps:
+                    # New random velocity command every hold_steps
+                    if cmd_counter % hold_steps == 0:
+                        current_cmd = torch.empty(num_envs, 3, device=device)
+                        current_cmd[:, 0].uniform_(-action_limit, action_limit)  # vx
+                        current_cmd[:, 1].uniform_(-action_limit, action_limit)  # vy
+                        current_cmd[:, 2].uniform_(-0.5, 0.5)                   # vz
+                    cmd_counter += 1
+
+                    # Read pre-step velocity
+                    drone_state_pre = base_env.drone.get_state(env_frame=False)
+                    v_pre = drone_state_pre[..., 7:10].squeeze(1).clone()  # (num_envs, 3)
+
+                    # Step env with uniform command (goes through VelController)
+                    td_u.set(("agents", "action"), current_cmd)
+                    td_u = env.step(td_u)
+                    td_u_next = td_u["next"]
+
+                    # Read post-step velocity
+                    drone_state_post = base_env.drone.get_state(env_frame=False)
+                    v_post = drone_state_post[..., 7:10].squeeze(1).clone()  # (num_envs, 3)
+
+                    u_v_prev.append(v_pre.cpu())
+                    u_u_prev.append(current_cmd.cpu().clone())
+                    u_v_next.append(v_post.cpu())
+                    collected += num_envs
+
+                    # Reset drone if out of bounds
+                    pos = drone_state_post[..., :3].squeeze(1)
+                    oob = (pos[:, 0].abs() > 15.) | (pos[:, 1].abs() > 15.) | \
+                          (pos[:, 2] < 0.3) | (pos[:, 2] > 5.0)
+                    if oob.any():
+                        reset_ids = torch.where(oob)[0]
+                        base_env._reset_idx(reset_ids)
+                        for _ in range(20):
+                            td_u_next.set(("agents", "action"), zero_cmd)
+                            td_u_next = env.step(td_u_next)
+                            td_u_next = td_u_next["next"].clone()
+
+                    td_u = td_u_next.clone()
+
+                    if collected % (num_envs * 200) == 0:
+                        print(f"  [eval-uniform] {collected}/{uniform_steps} transitions")
+
+                # Merge uniform data into the collection
+                if u_v_prev:
+                    uni_v_prev = torch.cat(u_v_prev, dim=0)
+                    uni_u_prev = torch.cat(u_u_prev, dim=0)
+                    uni_v_next = torch.cat(u_v_next, dim=0)
+                    all_v_prev.append(uni_v_prev)
+                    all_u_prev.append(uni_u_prev)
+                    all_v_next.append(uni_v_next)
+                    ep_lengths.append(uni_v_prev.shape[0])
+                    print(f"[eval-uniform] Collected {uni_v_prev.shape[0]} uniform transitions")
+                    print(f"  cmd vx: [{uni_u_prev[:,0].min():.2f}, {uni_u_prev[:,0].max():.2f}], "
+                          f"vy: [{uni_u_prev[:,1].min():.2f}, {uni_u_prev[:,1].max():.2f}]")
+
+            # ---- Save combined data ----
             if all_v_prev:
                 new_v_prev = torch.cat(all_v_prev, dim=0)
                 new_u_prev = torch.cat(all_u_prev, dim=0)
@@ -305,7 +393,11 @@ def evaluate(
                     "v_next": new_v_next,
                     "ep_lengths": new_ep_lengths,
                 }, export_path)
-                print(f"[eval] Nominal transition data: {new_v_prev.shape[0]} total samples, {new_ep_lengths.shape[0]} episodes -> {export_path}")
+                total_policy = sum(ep_lengths[:-1]) if uniform_steps > 0 and len(ep_lengths) > 1 else sum(ep_lengths)
+                total_uniform = ep_lengths[-1] if uniform_steps > 0 and len(ep_lengths) > 1 else 0
+                print(f"[eval] Nominal transition data saved: "
+                      f"{new_v_prev.shape[0]} total ({total_policy} policy + {total_uniform} uniform), "
+                      f"{new_ep_lengths.shape[0]} episodes -> {export_path}")
             else:
                 print("[eval] WARNING: no valid episodes found (all ep_len < 2)")
         else:

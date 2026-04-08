@@ -2,10 +2,9 @@
 Collect transition data (v_prev, u_prev, v_next) with uniformly distributed
 velocity commands, bypassing the trained policy.
 
-Instead of relying on the policy's natural command distribution (biased toward
-navigation goals), this script sends random velocity commands sampled uniformly
-from [-action_limit, action_limit] in each axis. This produces a much more
-uniform coverage of the (vx, vy) input space for fitting transition models.
+NOTE: This functionality is now also integrated into evaluate() in utils.py.
+      Set `uniform_data.num_steps > 0` in train.yaml to collect uniform data
+      during eval runs. This standalone script is kept for ad-hoc collection.
 
 Usage (from Isaac Sim python):
     python collect_uniform_data.py --output ./uniform_data.pt --num_steps 20000
