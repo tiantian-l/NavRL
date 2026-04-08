@@ -37,9 +37,9 @@ wandb:
   mode: offline # online
   run_id: #kw9xf9k9
 
-# Uniform transition data collection during eval
+# Uniform transition data collection during eval (drive-then-probe)
 # Set num_steps > 0 to enable; 0 to disable
 uniform_data:
   num_steps: 5000       # number of uniform-cmd transitions per eval (0=disabled)
-  hold_steps: 20        # hold each random vel command for N sim steps (~0.32s)
-  settle_steps: 60      # initial settle steps after reset (discarded)
+  approach_steps: 80    # steps to drive toward target velocity (~1.28s, ~3 time constants)
+  num_probes: 3         # probe commands per approach cycle (amortizes approach cost)

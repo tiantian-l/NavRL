@@ -289,75 +289,83 @@ def evaluate(
                 print(f"[eval] env{ei}: ep_len={ep_len}, collected {ep_len-1} transitions")
 
             # ---- Collect uniform-command transitions in the same eval env ----
+            # Strategy: "drive-then-probe" for uniform (v_prev, u_prev) coverage
+            #   1. Teleport drone to center, zero velocity
+            #   2. Command random v_target for approach_steps -> drone reaches v_target
+            #   3. Command random u_probe for 1 step -> record (v_actual, u_probe, v_next)
+            #   4. Repeat probe num_probes times to amortize approach cost
+            # This ensures BOTH v_prev AND u_prev are uniformly distributed.
             uniform_cfg = getattr(cfg, 'uniform_data', None)
             uniform_steps = int(uniform_cfg.num_steps) if uniform_cfg and hasattr(uniform_cfg, 'num_steps') else 0
             if uniform_steps > 0:
-                hold_steps = int(getattr(uniform_cfg, 'hold_steps', 20))
-                settle_steps = int(getattr(uniform_cfg, 'settle_steps', 60))
+                approach_steps = int(getattr(uniform_cfg, 'approach_steps', 80))
+                num_probes = int(getattr(uniform_cfg, 'num_probes', 3))
                 action_limit = cfg.algo.actor.action_limit
                 device = cfg.device
 
-                print(f"\n[eval-uniform] Collecting {uniform_steps} uniform transitions "
-                      f"(hold={hold_steps}, settle={settle_steps}, limit={action_limit})")
+                print(f"\n[eval-uniform] Strategy: drive-then-probe")
+                print(f"[eval-uniform] Target: {uniform_steps} transitions, "
+                      f"approach={approach_steps} steps (~{approach_steps*0.016:.2f}s), "
+                      f"probes_per_init={num_probes}, limit={action_limit}")
 
-                # Reset all envs for uniform collection (still in eval mode)
                 base_env = env.base_env if hasattr(env, 'base_env') else env
                 td_u = env.reset()
 
-                # Settle: send zero commands so drone stabilizes after reset
-                zero_cmd = torch.zeros(num_envs, 3, device=device)
-                for _ in range(settle_steps):
-                    td_u.set(("agents", "action"), zero_cmd)
-                    td_u = env.step(td_u)
-                    td_u = td_u["next"].clone()
-
                 u_v_prev, u_u_prev, u_v_next = [], [], []
-                cmd_counter = 0
-                current_cmd = torch.zeros(num_envs, 3, device=device)
                 collected = 0
+                all_ids = torch.arange(num_envs, device=device)
+
+                # Center position for teleportation between cycles
+                center_pos = torch.zeros(num_envs, 1, 3, device=device)
+                center_pos[..., 2] = 2.0  # hover height
+                default_rot = torch.zeros(num_envs, 1, 4, device=device)
+                default_rot[..., 0] = 1.0  # identity quaternion (w=1)
 
                 while collected < uniform_steps:
-                    # New random velocity command every hold_steps
-                    if cmd_counter % hold_steps == 0:
-                        current_cmd = torch.empty(num_envs, 3, device=device)
-                        current_cmd[:, 0].uniform_(-action_limit, action_limit)  # vx
-                        current_cmd[:, 1].uniform_(-action_limit, action_limit)  # vy
-                        current_cmd[:, 2].uniform_(-0.5, 0.5)                   # vz
-                    cmd_counter += 1
+                    # === Phase 1: Drive to random initial velocity ===
+                    # Teleport drone to center with zero velocity
+                    base_env.drone.set_world_poses(center_pos, default_rot, all_ids)
+                    base_env.drone.set_velocities(base_env.init_vels, all_ids)
 
-                    # Read pre-step velocity
-                    drone_state_pre = base_env.drone.get_state(env_frame=False)
-                    v_pre = drone_state_pre[..., 7:10].squeeze(1).clone()  # (num_envs, 3)
+                    # Sample random target velocity for v_prev coverage
+                    v_target = torch.empty(num_envs, 3, device=device)
+                    v_target[:, 0].uniform_(-action_limit, action_limit)  # vx
+                    v_target[:, 1].uniform_(-action_limit, action_limit)  # vy
+                    v_target[:, 2].uniform_(-0.5, 0.5)                   # vz
 
-                    # Step env with uniform command (goes through VelController)
-                    td_u.set(("agents", "action"), current_cmd)
-                    td_u = env.step(td_u)
-                    td_u_next = td_u["next"]
+                    # Approach: command v_target until drone tracks it
+                    for _ in range(approach_steps):
+                        td_u.set(("agents", "action"), v_target)
+                        td_u = env.step(td_u)
+                        td_u = td_u["next"].clone()
 
-                    # Read post-step velocity
-                    drone_state_post = base_env.drone.get_state(env_frame=False)
-                    v_post = drone_state_post[..., 7:10].squeeze(1).clone()  # (num_envs, 3)
+                    # === Phase 2: Probe with random commands ===
+                    for _ in range(num_probes):
+                        # Sample random probe command for u_prev coverage
+                        u_probe = torch.empty(num_envs, 3, device=device)
+                        u_probe[:, 0].uniform_(-action_limit, action_limit)
+                        u_probe[:, 1].uniform_(-action_limit, action_limit)
+                        u_probe[:, 2].uniform_(-0.5, 0.5)
 
-                    u_v_prev.append(v_pre.cpu())
-                    u_u_prev.append(current_cmd.cpu().clone())
-                    u_v_next.append(v_post.cpu())
-                    collected += num_envs
+                        # Read pre-step velocity (should be close to v_target)
+                        drone_state_pre = base_env.drone.get_state(env_frame=False)
+                        v_pre = drone_state_pre[..., 7:10].squeeze(1).clone()
 
-                    # Reset drone if out of bounds
-                    pos = drone_state_post[..., :3].squeeze(1)
-                    oob = (pos[:, 0].abs() > 15.) | (pos[:, 1].abs() > 15.) | \
-                          (pos[:, 2] < 0.3) | (pos[:, 2] > 5.0)
-                    if oob.any():
-                        reset_ids = torch.where(oob)[0]
-                        base_env._reset_idx(reset_ids)
-                        for _ in range(20):
-                            td_u_next.set(("agents", "action"), zero_cmd)
-                            td_u_next = env.step(td_u_next)
-                            td_u_next = td_u_next["next"].clone()
+                        # Apply probe command (goes through VelController)
+                        td_u.set(("agents", "action"), u_probe)
+                        td_u = env.step(td_u)
+                        td_u = td_u["next"].clone()
 
-                    td_u = td_u_next.clone()
+                        # Read post-step velocity
+                        drone_state_post = base_env.drone.get_state(env_frame=False)
+                        v_post = drone_state_post[..., 7:10].squeeze(1).clone()
 
-                    if collected % (num_envs * 200) == 0:
+                        u_v_prev.append(v_pre.cpu())
+                        u_u_prev.append(u_probe.cpu().clone())
+                        u_v_next.append(v_post.cpu())
+                        collected += num_envs
+
+                    if collected % (num_envs * 50) == 0:
                         print(f"  [eval-uniform] {collected}/{uniform_steps} transitions")
 
                 # Merge uniform data into the collection
@@ -369,8 +377,10 @@ def evaluate(
                     all_u_prev.append(uni_u_prev)
                     all_v_next.append(uni_v_next)
                     ep_lengths.append(uni_v_prev.shape[0])
-                    print(f"[eval-uniform] Collected {uni_v_prev.shape[0]} uniform transitions")
-                    print(f"  cmd vx: [{uni_u_prev[:,0].min():.2f}, {uni_u_prev[:,0].max():.2f}], "
+                    print(f"[eval-uniform] Collected {uni_v_prev.shape[0]} transitions")
+                    print(f"  v_prev vx: [{uni_v_prev[:,0].min():.2f}, {uni_v_prev[:,0].max():.2f}], "
+                          f"vy: [{uni_v_prev[:,1].min():.2f}, {uni_v_prev[:,1].max():.2f}]")
+                    print(f"  u_prev vx: [{uni_u_prev[:,0].min():.2f}, {uni_u_prev[:,0].max():.2f}], "
                           f"vy: [{uni_u_prev[:,1].min():.2f}, {uni_u_prev[:,1].max():.2f}]")
 
             # ---- Save combined data ----
