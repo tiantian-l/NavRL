@@ -260,6 +260,8 @@ class VelController(Transform):
         )
 
         torch.nan_to_num_(cmds, 0.)
+        # Save the original velocity command before overwriting with motor thrusts
+        tensordict.set(("agents", "action_vel_cmd"), action.detach().clone())
         tensordict.set(self.action_key, cmds)
         return tensordict
 

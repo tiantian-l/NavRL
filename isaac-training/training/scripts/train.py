@@ -12,6 +12,7 @@ from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
 from torchrl.envs.transforms import TransformedEnv, Compose
 from utils import evaluate
+from dynamics_collector import DynamicsCollector
 from torchrl.envs.utils import ExplorationType
 
 
@@ -81,12 +82,25 @@ def main(cfg):
         exploration_type=ExplorationType.RANDOM, # sample from normal distribution
     )
 
+    # Dynamics Data Collector (for GP training)
+    dynamics_save_dir = os.path.join(run.dir, "dynamics_data")
+    dynamics_collector = DynamicsCollector(
+        save_dir=dynamics_save_dir,
+        num_envs=cfg.env.num_envs,
+        save_interval=cfg.get("dynamics_save_interval", 2000),
+        uniform_grid_bins=cfg.get("dynamics_grid_bins", 0),     # 0 = collect all; e.g. 20 for uniform coverage
+        uniform_max_per_bin=cfg.get("dynamics_max_per_bin", 200),
+    )
+
     # Training Loop
     for i, data in enumerate(collector):
         # print("data: ", data)
         # print("============================")
         # Log Info
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+
+        # Collect dynamics data for GP
+        dynamics_collector.collect_batch(data, iteration=i)
 
         # Train Policy
         train_loss_stats = policy.train(data)
@@ -131,6 +145,7 @@ def main(cfg):
 
     ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
     torch.save(policy.state_dict(), ckpt_path)
+    dynamics_collector.save(tag="final")
     wandb.finish()
     sim_app.close()
 

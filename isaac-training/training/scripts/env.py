@@ -92,6 +92,8 @@ class NavigationEnv(IsaacEnv):
             self.target_dir = torch.zeros(self.num_envs, 1, 3)
             self.height_range = torch.zeros(self.num_envs, 1, 2)
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
+            # Dynamics data collection: store last velocity command (world frame)
+            self._last_cmd_w_xy = torch.zeros(self.num_envs, 2)
             # Wind disturbance: constant force per episode (world frame, m/s^2 equiv)
             self.wind_force = torch.zeros(self.num_envs, 1, 3)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
@@ -364,6 +366,13 @@ class NavigationEnv(IsaacEnv):
         info_spec = CompositeSpec({
             "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
         }).expand(self.num_envs).to(self.device)
+        # Dynamics observation spec (for GP data collection)
+        dynamics_spec = CompositeSpec({
+            "vel_w_xy": UnboundedContinuousTensorSpec((2,), device=self.device),
+            "cmd_w_xy": UnboundedContinuousTensorSpec((2,), device=self.device),
+        }).expand(self.num_envs).to(self.device)
+        self.observation_spec[("agents", "observation", "dynamics")] = dynamics_spec
+
         self.observation_spec["stats"] = stats_spec
         self.observation_spec["info"] = info_spec
         self.stats = stats_spec.zero()
@@ -437,6 +446,7 @@ class NavigationEnv(IsaacEnv):
         self.drone.set_world_poses(pos, rot, env_ids)
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.prev_drone_vel_w[env_ids] = 0.
+        self._last_cmd_w_xy[env_ids] = 0.
         # Sample wind disturbance for new episodes (only during eval if configured)
         self._sample_wind(env_ids)
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
@@ -467,6 +477,11 @@ class NavigationEnv(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        # Store velocity command (world frame, xy only) for dynamics data collection
+        # action_vel_cmd is the 3D velocity command saved by VelController before converting to motor thrusts
+        vel_cmd = tensordict.get(("agents", "action_vel_cmd"), None)
+        if vel_cmd is not None:
+            self._last_cmd_w_xy = vel_cmd[..., :2].detach().clone().reshape(self.num_envs, 2)
         self.drone.apply_action(actions)
         # Apply wind disturbance as external force on the base link (world frame)
         if self.wind_force.any():
@@ -595,6 +610,12 @@ class NavigationEnv(IsaacEnv):
             "lidar": self.lidar_scan,
             "direction": target_dir_2d,
             "dynamic_obstacle": dyn_obs_states
+        }
+
+        # Dynamics data for GP: world-frame velocity (xy) and last command (xy)
+        obs["dynamics"] = {
+            "vel_w_xy": vel_w[..., :2].squeeze(1).detach().clone(),   # (num_envs, 2)
+            "cmd_w_xy": self._last_cmd_w_xy.detach().clone(),         # (num_envs, 2)
         }
 
 
