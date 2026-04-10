@@ -12,6 +12,7 @@ from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
 from torchrl.envs.transforms import TransformedEnv, Compose
 from utils import evaluate
+from dynamics_collector import DynamicsCollector
 from torchrl.envs.utils import ExplorationType
 
 
@@ -78,6 +79,14 @@ def main(cfg):
         exploration_type=ExplorationType.RANDOM, # sample from normal distribution
     )
 
+    # Dynamics Data Collector (for eval data)
+    dynamics_save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "dynamics_data")
+    dynamics_collector = DynamicsCollector(
+        save_dir=dynamics_save_dir,
+        num_envs=cfg.env.num_envs,
+        save_interval=0,  # no auto-save, we save manually
+    )
+
     # Training Loop
     for i, data in enumerate(collector):
         # print("data: ", data)
@@ -113,6 +122,12 @@ def main(cfg):
         env.reset()
         info.update(eval_info)
         print("\n[NavRL]: evaluation done.")
+
+        # Collect eval dynamics data
+        dynamics_collector.collect_eval_rollout(eval_trajs)
+        print(f"[DynamicsCollector] Eval step {i}: {dynamics_collector.num_eval_transitions} transitions, "
+              f"{dynamics_collector.num_eval_trajectories} trajectories")
+        dynamics_collector.save(tag="eval_latest")
         
         # Update wand info
         run.log(info)
@@ -126,6 +141,7 @@ def main(cfg):
 
     # ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
     # torch.save(policy.state_dict(), ckpt_path)
+    dynamics_collector.save(tag="eval_final")
     wandb.finish()
     sim_app.close()
 
