@@ -174,11 +174,14 @@ class DynamicsCollector:
             else:
                 accept_mask = torch.ones(num_envs, dtype=torch.bool)
 
-            # Store accepted transitions
+            # Store accepted transitions (flat dataset, subject to grid filter)
             for env_idx in range(num_envs):
+                # Trajectory always gets the full transition (no filtering)
+                self._episode_buffers[env_idx].append(transition[env_idx])
+
+                # Flat dataset respects grid filter
                 if accept_mask[env_idx]:
                     self._transitions.append(transition[env_idx])
-                    self._episode_buffers[env_idx].append(transition[env_idx])
 
                 # If episode ends, finalize the trajectory
                 if d_t[env_idx]:
