@@ -211,7 +211,7 @@ def evaluate(
     env.train()
     # env.reset()
 
-    return info
+    return info, trajs
 
 
 def vec_to_new_frame(vec, goal_direction):

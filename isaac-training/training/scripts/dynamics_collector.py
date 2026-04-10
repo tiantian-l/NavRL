@@ -100,6 +100,10 @@ class DynamicsCollector:
 
         os.makedirs(save_dir, exist_ok=True)
 
+        # Separate eval data storage
+        self._eval_transitions: List[torch.Tensor] = []
+        self._eval_trajectories: List[torch.Tensor] = []
+
     def _to_bin_idx(self, values: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
         """Map continuous values to bin indices."""
         clamped = values.clamp(vmin, vmax)
@@ -243,8 +247,71 @@ class DynamicsCollector:
         """
         return self._trajectories
 
+    def collect_eval_rollout(self, trajs: TensorDictBase):
+        """Collect dynamics data from an eval rollout.
+
+        Eval data is stored SEPARATELY from training data, so it can be
+        analyzed independently (e.g. under domain randomization conditions).
+
+        Args:
+            trajs: TensorDict from env.rollout(), shape (num_envs, max_steps, ...)
+        """
+        vel_w_xy = trajs["agents", "observation", "dynamics", "vel_w_xy"]        # (E, T, 2)
+        cmd_w_xy = trajs["agents", "observation", "dynamics", "cmd_w_xy"]        # (E, T, 2)
+        next_vel_w_xy = trajs["next", "agents", "observation", "dynamics", "vel_w_xy"]  # (E, T, 2)
+        done = trajs["next", "done"].squeeze(-1)                                  # (E, T)
+
+        num_envs, T = vel_w_xy.shape[:2]
+
+        for env_idx in range(num_envs):
+            ep_buf = []
+            for t in range(T):
+                v_t = vel_w_xy[env_idx, t].cpu()
+                u_t = cmd_w_xy[env_idx, t].cpu()
+                v_tp1 = next_vel_w_xy[env_idx, t].cpu()
+
+                transition = torch.cat([v_t, u_t, v_tp1], dim=-1)  # (6,)
+                self._eval_transitions.append(transition)
+                ep_buf.append(transition)
+
+                if done[env_idx, t]:
+                    if len(ep_buf) > 0:
+                        self._eval_trajectories.append(torch.stack(ep_buf, dim=0))
+                        ep_buf = []
+
+            # If episode didn't terminate within max_steps, save what we have
+            if len(ep_buf) > 0:
+                self._eval_trajectories.append(torch.stack(ep_buf, dim=0))
+
+        print(f"[DynamicsCollector] Eval: collected {len(self._eval_transitions)} transitions, "
+              f"{len(self._eval_trajectories)} trajectories")
+
+    @property
+    def num_eval_transitions(self) -> int:
+        return len(self._eval_transitions)
+
+    @property
+    def num_eval_trajectories(self) -> int:
+        return len(self._eval_trajectories)
+
+    def get_eval_dataset(self) -> Dict[str, torch.Tensor]:
+        """Return eval dataset as dict of tensors."""
+        if len(self._eval_transitions) == 0:
+            return {
+                "state": torch.zeros(0, 2),
+                "action": torch.zeros(0, 2),
+                "next_state": torch.zeros(0, 2),
+            }
+        all_data = torch.stack(self._eval_transitions, dim=0)
+        return {
+            "state": all_data[:, :2],
+            "action": all_data[:, 2:4],
+            "next_state": all_data[:, 4:6],
+        }
+
     def save(self, tag: str = "final"):
         """Save collected data to disk."""
+        # --- Training data ---
         # Flat transitions
         dataset = self.get_dataset()
         flat_path = os.path.join(self.save_dir, f"dynamics_transitions_{tag}.pt")
@@ -261,6 +328,14 @@ class DynamicsCollector:
 
         print(f"[DynamicsCollector] Saved {self.num_transitions} transitions, "
               f"{self.num_trajectories} trajectories -> {self.save_dir} (tag={tag})")
+
+        # --- Eval data (separate files) ---
+        if len(self._eval_transitions) > 0:
+            eval_dataset = self.get_eval_dataset()
+            torch.save(eval_dataset, os.path.join(self.save_dir, f"eval_transitions_{tag}.pt"))
+            torch.save(self._eval_trajectories, os.path.join(self.save_dir, f"eval_trajectories_{tag}.pt"))
+            print(f"[DynamicsCollector] Saved {self.num_eval_transitions} eval transitions, "
+                  f"{self.num_eval_trajectories} eval trajectories (tag={tag})")
 
     def get_grid_coverage_stats(self) -> Dict[str, float]:
         """Return statistics about grid coverage (only if grid mode is enabled)."""

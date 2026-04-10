@@ -125,7 +125,7 @@ def main(cfg):
             print("[NavRL]: start evaluating policy at training step: ", i)
             env.enable_render(True)
             env.eval()
-            eval_info = evaluate(
+            eval_info, eval_trajs = evaluate(
                 env=transformed_env, 
                 policy=policy,
                 seed=cfg.seed, 
@@ -136,6 +136,11 @@ def main(cfg):
             env.train()
             env.reset()
             info.update(eval_info)
+
+            # Collect eval dynamics data (with domain randomization)
+            dynamics_collector.collect_eval_rollout(eval_trajs)
+            info["dynamics/eval_transitions"] = dynamics_collector.num_eval_transitions
+            info["dynamics/eval_trajectories"] = dynamics_collector.num_eval_trajectories
             print("\n[NavRL]: evaluation done.")
         
         # Update wand info

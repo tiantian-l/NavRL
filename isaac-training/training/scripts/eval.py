@@ -102,7 +102,7 @@ def main(cfg):
         # if i % cfg.eval_interval == 0:
         print("[NavRL]: start evaluating policy at training step: ", i)
         env.eval()
-        eval_info = evaluate(
+        eval_info, eval_trajs = evaluate(
             env=transformed_env, 
             policy=policy,
             seed=cfg.seed, 
