@@ -193,6 +193,11 @@ class DynamicsCollector:
                     self._update_grid(accepted[:, :2], accepted[:, 2:4])
 
         self._step_count += 1
+
+        # Save a "latest" snapshot frequently so data is available if training is stopped early
+        # Tagged snapshots are saved less often (save_interval) for versioning
+        if self._step_count % max(self.save_interval // 10, 1) == 0:
+            self.save(tag="latest")
         if self.save_interval > 0 and self._step_count % self.save_interval == 0:
             self.save(tag=f"iter_{self._step_count}")
 

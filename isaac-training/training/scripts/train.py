@@ -83,11 +83,11 @@ def main(cfg):
     )
 
     # Dynamics Data Collector (for GP training)
-    dynamics_save_dir = os.path.join(run.dir, "dynamics_data")
+    dynamics_save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "dynamics_data")
     dynamics_collector = DynamicsCollector(
         save_dir=dynamics_save_dir,
         num_envs=cfg.env.num_envs,
-        save_interval=cfg.get("dynamics_save_interval", 2000),
+        save_interval=cfg.get("dynamics_save_interval", 500),
         uniform_grid_bins=cfg.get("dynamics_grid_bins", 0),     # 0 = collect all; e.g. 20 for uniform coverage
         uniform_max_per_bin=cfg.get("dynamics_max_per_bin", 200),
     )
@@ -101,6 +101,11 @@ def main(cfg):
 
         # Collect dynamics data for GP
         dynamics_collector.collect_batch(data, iteration=i)
+        info["dynamics/num_transitions"] = dynamics_collector.num_transitions
+        info["dynamics/num_trajectories"] = dynamics_collector.num_trajectories
+        if dynamics_collector._use_grid:
+            grid_stats = dynamics_collector.get_grid_coverage_stats()
+            info["dynamics/grid_coverage"] = grid_stats["coverage_ratio"]
 
         # Train Policy
         train_loss_stats = policy.train(data)
