@@ -58,7 +58,7 @@ def main(cfg):
     # PPO Policy
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
 
-    checkpoint = "/home/tiali/project/NavRL/wandb/offline-run-20260220_184023-5f8e5k7t/files/checkpoint_60000.pt"
+    checkpoint = "/home/tiali/project/NavRL/quick-demos/ckpts/navrl_checkpoint.pt"
     policy.load_state_dict(torch.load(checkpoint))
     
     # Episode Stats Collector
