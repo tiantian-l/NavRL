@@ -87,6 +87,8 @@ def main(cfg):
         save_interval=0,  # no auto-save, we save manually
     )
 
+    
+
     # Training Loop
     for i, data in enumerate(collector):
         # print("data: ", data)

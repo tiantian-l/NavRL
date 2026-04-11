@@ -79,9 +79,8 @@ class DynamicsCollector:
         # columns: [vx, vy, ux, uy, vx_next, vy_next]
         self._trajectories: List[torch.Tensor] = []
 
-        # Prev-step state tracking per env (needed because data comes in batches)
-        self._prev_vel: Optional[torch.Tensor] = None   # (num_envs, 2)
-        self._prev_cmd: Optional[torch.Tensor] = None   # (num_envs, 2)
+         
+       
 
         # Uniform coverage grid
         self._use_grid = uniform_grid_bins > 0
@@ -308,34 +307,52 @@ class DynamicsCollector:
             "action": all_data[:, 2:4],
             "next_state": all_data[:, 4:6],
         }
-
+    
     def save(self, tag: str = "final"):
-        """Save collected data to disk."""
-        # --- Training data ---
-        # Flat transitions
-        dataset = self.get_dataset()
-        flat_path = os.path.join(self.save_dir, f"dynamics_transitions_{tag}.pt")
-        torch.save(dataset, flat_path)
+        """Save collected train/eval data to disk."""
 
-        # Episode trajectories
-        traj_path = os.path.join(self.save_dir, f"dynamics_trajectories_{tag}.pt")
-        torch.save(self._trajectories, traj_path)
+        # =========================
+        # --- Train data ---
+        # =========================
+        train_dataset = self.get_dataset()
+        train_flat_path = os.path.join(self.save_dir, f"train_transitions_{tag}.pt")
+        torch.save(train_dataset, train_flat_path)
 
-        # Grid coverage info
+        train_traj_path = os.path.join(self.save_dir, f"train_trajectories_{tag}.pt")
+        torch.save(self._trajectories, train_traj_path)
+
+        # Grid coverage info (train only)
         if self._use_grid:
-            grid_path = os.path.join(self.save_dir, f"grid_coverage_{tag}.npy")
+            grid_path = os.path.join(self.save_dir, f"train_grid_coverage_{tag}.npy")
             np.save(grid_path, self._grid_counts)
 
-        print(f"[DynamicsCollector] Saved {self.num_transitions} transitions, "
-              f"{self.num_trajectories} trajectories -> {self.save_dir} (tag={tag})")
+        print(
+            f"[DynamicsCollector] Saved TRAIN data: "
+            f"{self.num_transitions} transitions, "
+            f"{self.num_trajectories} trajectories "
+            f"(tag={tag})"
+        )
 
-        # --- Eval data (separate files) ---
+        # =========================
+        # --- Eval data ---
+        # =========================
         if len(self._eval_transitions) > 0:
             eval_dataset = self.get_eval_dataset()
-            torch.save(eval_dataset, os.path.join(self.save_dir, f"eval_transitions_{tag}.pt"))
-            torch.save(self._eval_trajectories, os.path.join(self.save_dir, f"eval_trajectories_{tag}.pt"))
-            print(f"[DynamicsCollector] Saved {self.num_eval_transitions} eval transitions, "
-                  f"{self.num_eval_trajectories} eval trajectories (tag={tag})")
+
+            eval_flat_path = os.path.join(self.save_dir, f"eval_transitions_{tag}.pt")
+            eval_traj_path = os.path.join(self.save_dir, f"eval_trajectories_{tag}.pt")
+
+            torch.save(eval_dataset, eval_flat_path)
+            torch.save(self._eval_trajectories, eval_traj_path)
+
+            print(
+                f"[DynamicsCollector] Saved EVAL data: "
+                f"{self.num_eval_transitions} transitions, "
+                f"{self.num_eval_trajectories} trajectories "
+                f"(tag={tag})"
+            )
+
+  
 
     def get_grid_coverage_stats(self) -> Dict[str, float]:
         """Return statistics about grid coverage (only if grid mode is enabled)."""

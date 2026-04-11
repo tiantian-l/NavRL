@@ -478,11 +478,22 @@ def evaluate_probabilistic_regression_xy(y_true, mean, std, prefix="GP Transitio
 
 def load_xy_data(data_path):
     print(f"Loading data from {data_path} ...")
-    data = torch.load(data_path, map_location="cpu", weights_only=True)
+    data = torch.load(data_path, map_location="cpu")
 
-    v_prev = data["v_prev"].float()[:, :2]
-    u_prev = data["u_prev"].float()[:, :2]
-    v_next = data["v_next"].float()[:, :2]
+    print("Available keys:", data.keys())
+
+    state = data["state"].float()
+    action = data["action"].float()
+    next_state = data["next_state"].float()
+
+    print(f"state shape      : {state.shape}")
+    print(f"action shape     : {action.shape}")
+    print(f"next_state shape : {next_state.shape}")
+
+    v_prev = state[:, :2]
+    u_prev = action[:, :2]
+    v_next = next_state[:, :2]
+
     ep_lengths = data.get("ep_lengths", None)
 
     N = v_prev.shape[0]
