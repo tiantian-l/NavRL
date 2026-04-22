@@ -334,6 +334,9 @@ class NavigationEnv(IsaacEnv):
             "episode_len": UnboundedContinuousTensorSpec(1),
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
+            "collision_static": UnboundedContinuousTensorSpec(1),
+            "collision_dynamic": UnboundedContinuousTensorSpec(1),
+            "collision_both": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
         }).expand(self.num_envs).to(self.device)
 
@@ -590,10 +593,19 @@ class NavigationEnv(IsaacEnv):
         self.prev_drone_vel_w = self.drone.vel_w[..., :3].clone()
 
         # # -----------------Training Stats-----------------
+        # Collision source breakdown (mutually exclusive: static-only / dynamic-only / both).
+        # The three sum to `collision`, enabling stacked-bar visualization of failure causes.
+        collision_both_mask = static_collision & dynamic_collision
+        collision_static_only = static_collision & ~dynamic_collision
+        collision_dynamic_only = dynamic_collision & ~static_collision
+
         self.stats["return"] += self.reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
+        self.stats["collision_static"] = collision_static_only.float()
+        self.stats["collision_dynamic"] = collision_dynamic_only.float()
+        self.stats["collision_both"] = collision_both_mask.float()
         self.stats["truncated"] = self.truncated.float()
 
         return TensorDict({
