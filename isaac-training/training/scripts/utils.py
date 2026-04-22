@@ -202,6 +202,36 @@ def evaluate(
         for k, v in traj_stats.items()
     }
 
+    # ----- Cumulative per-episode aggregation (new, additive) -----
+    # The default `take_first_episode` only counts each env's FIRST episode in
+    # the rollout. With `auto_reset=True`, envs that finish early continue
+    # running additional episodes whose statistics are otherwise discarded.
+    # Here we additionally aggregate over EVERY done step in the rollout so
+    # that easy/short episodes do not bias the metric. Logged under the
+    # `eval_cum/` prefix to coexist with the original `eval/stats.*` metrics.
+    done_cpu = done.cpu().squeeze(-1).bool()  # (num_envs, T)
+    num_episodes = int(done_cpu.sum().item())
+    info["eval_cum/num_episodes"] = num_episodes
+    if num_episodes > 0:
+        for k, v in trajs[("next", "stats")].cpu().items():
+            # v shape: (num_envs, T, *stat_shape); select all done steps
+            v_flat = v.reshape(done_cpu.shape + v.shape[2:])
+            picked = v_flat[done_cpu].float()  # (num_episodes, *stat_shape)
+            info["eval_cum/stats." + k] = picked.mean().item()
+
+        cs_c = info.get("eval_cum/stats.collision_static", 0.0)
+        cd_c = info.get("eval_cum/stats.collision_dynamic", 0.0)
+        cb_c = info.get("eval_cum/stats.collision_both", 0.0)
+        total_c = cs_c + cd_c + cb_c
+        if total_c > 0:
+            info["eval_cum/collision_share/static"] = cs_c / total_c
+            info["eval_cum/collision_share/dynamic"] = cd_c / total_c
+            info["eval_cum/collision_share/both"] = cb_c / total_c
+        else:
+            info["eval_cum/collision_share/static"] = 0.0
+            info["eval_cum/collision_share/dynamic"] = 0.0
+            info["eval_cum/collision_share/both"] = 0.0
+
     # Collision-source share (normalized to sum to 1 when there is any collision).
     # Useful for stacked-area visualization of failure causes over training.
     cs = info.get("eval/stats.collision_static", 0.0)
