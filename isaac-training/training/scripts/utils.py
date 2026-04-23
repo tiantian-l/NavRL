@@ -221,31 +221,25 @@ def evaluate(
 
         cs_c = info.get("eval_cum/stats.collision_static", 0.0)
         cd_c = info.get("eval_cum/stats.collision_dynamic", 0.0)
-        cb_c = info.get("eval_cum/stats.collision_both", 0.0)
-        total_c = cs_c + cd_c + cb_c
+        total_c = cs_c + cd_c
         if total_c > 0:
             info["eval_cum/collision_share/static"] = cs_c / total_c
             info["eval_cum/collision_share/dynamic"] = cd_c / total_c
-            info["eval_cum/collision_share/both"] = cb_c / total_c
         else:
             info["eval_cum/collision_share/static"] = 0.0
             info["eval_cum/collision_share/dynamic"] = 0.0
-            info["eval_cum/collision_share/both"] = 0.0
 
     # Collision-source share (normalized to sum to 1 when there is any collision).
     # Useful for stacked-area visualization of failure causes over training.
     cs = info.get("eval/stats.collision_static", 0.0)
     cd = info.get("eval/stats.collision_dynamic", 0.0)
-    cb = info.get("eval/stats.collision_both", 0.0)
-    total = cs + cd + cb
+    total = cs + cd
     if total > 0:
         info["eval/collision_share/static"] = cs / total
         info["eval/collision_share/dynamic"] = cd / total
-        info["eval/collision_share/both"] = cb / total
     else:
         info["eval/collision_share/static"] = 0.0
         info["eval/collision_share/dynamic"] = 0.0
-        info["eval/collision_share/both"] = 0.0
 
     # log video
     info["recording"] = wandb.Video(
